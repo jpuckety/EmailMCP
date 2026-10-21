@@ -20,7 +20,9 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 
 ### SMTP (Outbound)
 - Send plain text + HTML emails
-- Attachments (base64 in tool calls)
+- Attachments via base64, HTTPS URL, or allowlisted local path
+- Inline CID images, replies, and forwards
+- Drafts (`create_draft`) saved to IMAP Drafts — never sent
 - Per-account SMTP configuration with TLS support
 
 ### Multi-User Security
@@ -109,11 +111,13 @@ Cloud deploy and teardown are handled by MCPCICD, not this `run.sh`.
 | `remove_email_account`| Delete the user's account config                         |
 | `list_folders`        | List IMAP mailboxes                                      |
 | `search_emails`       | Search folder (summaries)                                |
-| `read_email`          | Fetch full message by UID                                |
+| `read_email`          | Fetch full message by UID (attachment metadata includes id/part_id) |
+| `get_attachment`      | Fetch one attachment (base64 or presigned URL)           |
 | `move_emails`         | Bulk move UIDs                                           |
 | `flag_emails`         | Add/remove flags                                         |
 | `delete_emails`       | Mark emails deleted                                      |
-| `send_email`          | Send message (text/HTML + attachments)                   |
+| `send_email`          | Send now (text/HTML + data/url/path attachments, reply/forward) |
+| `create_draft`        | Save to Drafts with `\\Draft`. Never sends.              |
 
 Account tools require an `account_id` parameter to specify which email account to use.
 
@@ -150,6 +154,25 @@ See `.env.example`. Key variables for the MCP server:
 - `EMAILMCP_IMAP_MAX_CONNS`: Max connections per account (default: 4).
 - `EMAILMCP_IMAP_IDLE_TIMEOUT`: Connection idle timeout (default: 5m).
 - `EMAILMCP_SMTP_TIMEOUT`: SMTP operation timeout (default: 30s).
+
+### Attachments, size limits, and Sent copies
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMAILMCP_ATTACHMENT_MAX_BYTES` | 10485760 (10 MiB) | Max decoded size per attachment (base64, URL, or path). |
+| `EMAILMCP_MESSAGE_MAX_BYTES` | 26214400 (25 MiB) | Max encoded RFC822 size before send/draft. |
+| `EMAILMCP_ATTACHMENT_URL_TIMEOUT` | 30s | HTTPS download timeout for `url` attachments. |
+| `EMAILMCP_ATTACHMENT_ALLOWED_HOSTS` | empty | Optional HTTPS host allowlist for `url` attachments. Empty = any public host. |
+| `EMAILMCP_ATTACHMENT_PATH_ALLOWLIST` | empty | Comma-separated directories for `path` attachments. Empty = path attachments disabled. |
+| `EMAILMCP_ATTACHMENT_INLINE_MAX` | 1048576 (1 MiB) | `get_attachment` returns base64 at or under this size. |
+| `EMAILMCP_ATTACHMENT_S3_BUCKET` | empty | When set, larger attachments get a short-lived presigned GET URL. |
+| `EMAILMCP_ATTACHMENT_S3_PREFIX` | `emailmcp-attachments/` | S3 key prefix. |
+| `EMAILMCP_ATTACHMENT_PRESIGN_TTL` | 15m | Presigned URL lifetime. |
+| `EMAILMCP_SAVE_TO_SENT` | `auto` | After SMTP send, IMAP-APPEND to Sent (`auto` / `true` / `false`). |
+
+**WorkMail notes** (AWS quotas as of 2026): incoming/outgoing MIME messages are capped at **40 MB** (29 MB unencoded). EmailMCP also enforces `EMAILMCP_MESSAGE_MAX_BYTES` (25 MiB by default); raise it up to 40 MiB if you need the full WorkMail cap. WorkMail SMTP does **not** reliably save a copy to Sent Items (unlike the web client). `save_to_sent=auto` therefore APPENDs a Sent copy for `*.awsapps.com` / WorkMail hosts, and skips the copy for Gmail (which already saves). Override per account (`save_to_sent` on `add_email_account`) or per `send_email` call.
+
+Use `create_draft` when the user should review the message; it APPENDs to Drafts with `\\Draft` and never calls SMTP. Attach by `url` (HTTPS only, SSRF-blocked) for large files such as presigned S3 objects instead of inline base64.
 
 ## Docker
 

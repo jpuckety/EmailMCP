@@ -40,6 +40,9 @@ HTTP mode (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`).
 PRs run GitHub Actions only (`go test ./...` + `docker build`). Merges to
 `master` are released by the MCPCICD pipeline named `email-mcp`.
 
+New in 0.2.0: `create_draft`, `get_attachment`, HTTPS/path attachments, replies/forwards,
+and Sent-folder copies. See [emailmcp/README.md](emailmcp/README.md) and [CHANGELOG.md](CHANGELOG.md).
+
 ## Pipeline contract
 
 MCPCICD expects:

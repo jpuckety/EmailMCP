@@ -50,7 +50,9 @@ EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) 
 - Reuse SMTP clients when possible but handle connection failures gracefully.
 - Support both plain text and HTML bodies.
 - Attachment handling should be clean and memory-efficient for reasonable sizes.
-- Attachments arrive base64-encoded in tool input; decode only when sending.
+- Attachments may be base64 (`data`), HTTPS `url`, or allowlisted `path`. Decode/fetch only when sending or drafting.
+- `send_email` and `create_draft` must share `mailbuild` so MIME never drifts. `create_draft` must never SMTP-send.
+- Never log message bodies, attachment bytes, or credentials — sizes and IDs only.
 
 ## Testing & Quality
 - Write tests for the DynamoDB store and connection pool logic.
