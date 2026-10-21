@@ -360,6 +360,89 @@ import { Account, ProviderPreset, VerificationResult } from '../../models/accoun
           </div>
         </div>
 
+        <!-- Agent notifications -->
+        <div class="card">
+          <h3 class="card-section-title">Agent notifications</h3>
+          <p class="section-help">
+            Optional HTTPS webhook. New mail in watched folders is posted as an envelope summary so agents can wake without polling.
+          </p>
+
+          <div class="form-group">
+            <label class="form-label" for="webhookUrl">Webhook URL</label>
+            <input
+              id="webhookUrl"
+              type="url"
+              class="form-input"
+              [(ngModel)]="account.webhook_url"
+              name="webhook_url"
+              placeholder="https://example.com/webhooks/email"
+              autocomplete="off"
+            />
+            <div class="form-help">Must be HTTPS to a public host. Clear the field to stop watching this account.</div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="webhookToken">
+              Bearer token
+              <span *ngIf="isEditMode && account.has_webhook_token" class="badge-green token-badge">Saved</span>
+            </label>
+            <div class="password-input-wrapper">
+              <input
+                id="webhookToken"
+                [type]="showWebhookToken ? 'text' : 'password'"
+                class="form-input"
+                [(ngModel)]="account.webhook_token"
+                name="webhook_token"
+                [placeholder]="isEditMode ? 'Leave blank to keep current token' : 'Optional Authorization Bearer token'"
+                autocomplete="new-password"
+                (ngModelChange)="onWebhookTokenInput()"
+              />
+              <button
+                type="button"
+                class="btn-toggle-password"
+                (click)="showWebhookToken = !showWebhookToken"
+                title="Toggle token visibility"
+              >
+                <svg *ngIf="!showWebhookToken" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+                <svg *ngIf="showWebhookToken" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                  <line x1="1" y1="1" x2="23" y2="23"/>
+                </svg>
+              </button>
+            </div>
+            <label *ngIf="isEditMode && account.has_webhook_token" class="form-checkbox-label token-clear">
+              <input
+                type="checkbox"
+                [(ngModel)]="clearWebhookToken"
+                name="clear_webhook_token"
+                [disabled]="!!account.webhook_token"
+              />
+              <span>Remove saved token</span>
+            </label>
+            <div class="form-help">
+              Leave blank to keep the current token. The saved token is dropped if you clear the webhook URL or change its origin (scheme + host). Use Remove saved token to drop authentication while keeping the URL.
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="watchFolders">Watch folders</label>
+            <input
+              id="watchFolders"
+              type="text"
+              class="form-input"
+              [(ngModel)]="watchFoldersText"
+              name="watch_folders"
+              placeholder="INBOX, Sent (default)"
+            />
+            <div class="form-help">
+              Leave blank to watch INBOX and the account's Sent folder (resolved via IMAP special-use). Explicit names are used as-is — on Gmail, Sent is often [Gmail]/Sent Mail. Maximum 8 folders.
+            </div>
+          </div>
+        </div>
+
         <!-- Connection Verification & Action Card -->
         <div class="card action-card">
           <div class="verify-section">
@@ -434,6 +517,18 @@ import { Account, ProviderPreset, VerificationResult } from '../../models/accoun
       font-size: 16px;
       color: var(--gray-900);
       margin-bottom: 4px;
+    }
+
+    .token-clear {
+      margin-top: 8px;
+    }
+
+    .token-badge {
+      margin-left: 8px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: var(--radius-sm);
     }
 
     .section-header-with-badge {
@@ -668,6 +763,9 @@ export class AccountFormComponent implements OnInit {
 
   showImapPassword = false;
   showSmtpPassword = false;
+  showWebhookToken = false;
+  clearWebhookToken = false;
+  watchFoldersText = '';
 
   presets: ProviderPreset[] = [];
   selectedPresetInstructions = '';
@@ -687,7 +785,10 @@ export class AccountFormComponent implements OnInit {
     smtp_username: '',
     smtp_password: '',
     smtp_use_tls: true,
-    from_address: ''
+    from_address: '',
+    webhook_url: '',
+    webhook_token: '',
+    watch_folders: []
   };
 
   ngOnInit(): void {
@@ -711,8 +812,11 @@ export class AccountFormComponent implements OnInit {
         this.account = {
           ...acc,
           imap_password: '', // Blank initially in edit mode
-          smtp_password: ''
+          smtp_password: '',
+          webhook_token: ''
         };
+        this.clearWebhookToken = false;
+        this.watchFoldersText = foldersToText(acc.watch_folders);
       },
       error: (err) => {
         this.errorMessage.set(err?.error?.error || `Failed to load account ${id}.`);
@@ -793,11 +897,23 @@ export class AccountFormComponent implements OnInit {
     });
   }
 
+  onWebhookTokenInput(): void {
+    if (this.account.webhook_token) {
+      this.clearWebhookToken = false;
+    }
+  }
+
   saveAccount(): void {
     if (this.saving()) return;
 
-    this.saving.set(true);
     this.errorMessage.set('');
+    const watchFolders = parseWatchFolders(this.watchFoldersText);
+    if (watchFolders.length > MAX_WATCH_FOLDERS) {
+      this.errorMessage.set(`At most ${MAX_WATCH_FOLDERS} watch folders are allowed.`);
+      return;
+    }
+
+    this.saving.set(true);
 
     // Clean up input types
     const payload: Partial<Account> = {
@@ -811,7 +927,9 @@ export class AccountFormComponent implements OnInit {
       smtp_port: Number(this.account.smtp_port),
       smtp_username: this.account.smtp_username ? this.account.smtp_username.trim() : '',
       smtp_use_tls: this.account.smtp_use_tls,
-      from_address: this.account.from_address ? this.account.from_address.trim() : ''
+      from_address: this.account.from_address ? this.account.from_address.trim() : '',
+      webhook_url: this.account.webhook_url ? this.account.webhook_url.trim() : '',
+      watch_folders: watchFolders
     };
 
     if (this.account.imap_password && this.account.imap_password.trim()) {
@@ -819,6 +937,11 @@ export class AccountFormComponent implements OnInit {
     }
     if (this.account.smtp_password && this.account.smtp_password.trim()) {
       payload.smtp_password = this.account.smtp_password.trim();
+    }
+    if (this.account.webhook_token && this.account.webhook_token.trim()) {
+      payload.webhook_token = this.account.webhook_token.trim();
+    } else if (this.clearWebhookToken) {
+      payload.clear_webhook_token = true;
     }
 
     const saveObs = this.isEditMode
@@ -836,6 +959,22 @@ export class AccountFormComponent implements OnInit {
       }
     });
   }
+}
+
+const MAX_WATCH_FOLDERS = 8;
+
+function parseWatchFolders(text: string): string[] {
+  return text
+    .split(',')
+    .map((folder) => folder.trim())
+    .filter((folder) => folder.length > 0);
+}
+
+function foldersToText(folders?: string[]): string {
+  if (!folders || folders.length === 0) {
+    return '';
+  }
+  return folders.join(', ');
 }
 
 function httpErrorMessage(err: unknown, fallback: string): string {

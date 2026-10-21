@@ -12,7 +12,12 @@ export interface Account {
   smtp_password?: string;
   smtp_use_tls: boolean;
   from_address?: string;
+  webhook_url?: string;
+  webhook_token?: string;
+  clear_webhook_token?: boolean;
+  watch_folders?: string[];
   has_password?: boolean;
+  has_webhook_token?: boolean;
   created_at?: string;
   updated_at?: string;
 }
@@ -29,7 +34,10 @@ export interface AccountSummary {
   smtp_username?: string;
   smtp_use_tls: boolean;
   from_address?: string;
+  webhook_url?: string;
+  watch_folders?: string[];
   has_password?: boolean;
+  has_webhook_token?: boolean;
   created_at?: string;
   updated_at?: string;
 }

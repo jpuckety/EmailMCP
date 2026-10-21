@@ -68,6 +68,37 @@ cp .env.example .env
 
 The server listens on `:8080` by default and serves the Streamable HTTP transport at `/`. Startup fails if the configured DynamoDB table is unreachable.
 
+### Notify transport (local watcher)
+
+`emailmcp -transport notify` runs IMAP IDLE + webhook delivery only. It does **not**
+start MCP, OAuth, or the portal, and it does **not** require `GOOGLE_CLIENT_ID`.
+It serves `GET /health` on `EMAILMCP_LISTEN_ADDR` (default `:8080`). SIGTERM
+cancels IDLE workers and releases DynamoDB leases.
+
+```bash
+./emailmcp -transport notify
+# or, with docker compose (watcher on localhost:8081):
+docker compose up emailmcp-notify
+```
+
+Watching starts for accounts that have a webhook URL and IMAP password. Empty
+`watch_folders` means INBOX + the account's Sent folder (IMAP special-use).
+Locally, omit `EMAILMCP_NOTIFY_STATE_TABLE` to use in-memory leases (not for
+production). On ECS the table is required. MCPCICD env-stack deploys omit
+`imageUri`; the notify image is a GetAtt of SSM `/email-mcp/notify/image-uri`
+and stays the busybox placeholder until Dev Build or Prod Promote is followed
+by writing that parameter (see the repo-root README pipeline contract). Do not
+replace the bootstrap command with `-transport notify` while `entryPoint` is
+`sh -c`.
+
+The watcher has no write path for accounts, so it **requires the shared DynamoDB
+user-config table** (`EMAILMCP_USER_CONFIG_TABLE`, also used by the HTTP server
+and portal) and exits at startup if it is unset. With docker compose, set the
+same `EMAILMCP_USER_CONFIG_TABLE` (and AWS credentials/region) in `emailmcp/.env`
+for both `emailmcp` and `emailmcp-notify`; separate in-memory stores would never
+share accounts. SSM lookups for the notify-state table happen only for the
+notify transport.
+
 ### Installation (System-wide)
 
 If you want to install EmailMCP to your system:
@@ -147,8 +178,13 @@ See `.env.example`. Key variables for the MCP server:
 | `OAUTH_REDIRECT_ALLOWLIST` | No | Comma-separated HTTPS OAuth `redirect_uri` allowlist (host, `*.host`, or `https://…` URI). **Empty = not enforced** (any HTTPS host allowed). Loopback HTTP and custom schemes always allowed. Passed to EKS via ConfigMap. |
 | `APPLICATION_ID` | No | Application partition key (default: `default`). |
 | `EMAILMCP_LOG_LEVEL` | No | `debug`, `info` (default), `warn`, `error`. |
-| `EMAILMCP_TRANSPORT` | No | `http` (default) or `stdio`. |
+| `EMAILMCP_TRANSPORT` | No | `http` (default), `stdio`, or `notify`. |
 | `EMAILMCP_LISTEN_ADDR` | No | HTTP listen address (default: `:8080`). |
+| `EMAILMCP_NOTIFY_STATE_TABLE` | No (local) / Yes (ECS) | DynamoDB table for notify leases and UID watermarks. Resolved from SSM `/emailmcp/notify-state-table/name` when unset. In-memory fallback is local-only. |
+| `EMAILMCP_NOTIFY_OWNER` | No | Lease owner id. Must be unique per running task. Unset generates `hostname-pid-random`; the shared value `notify` is rejected. |
+| `EMAILMCP_NOTIFY_RECONCILE` | No | Account reconcile interval (default `30s`, min `5s`, max `5m`). |
+| `EMAILMCP_NOTIFY_WEBHOOK_TIMEOUT` | No | Webhook POST timeout (default `10s`, min `1s`, max `30s`). |
+| `EMAILMCP_NOTIFY_MAX_FOLDERS` | No | Max watched folders per account (default `8`, hard cap `8`). |
 
 ### IMAP & SMTP Tuning
 - `EMAILMCP_IMAP_MAX_CONNS`: Max connections per account (default: 4).
@@ -319,7 +355,8 @@ emailmcp/
   cmd/emailmcp          - Entry point
   internal/
     config/             - Env config + DynamoDB store (SDK)
-    imap/               - Connection pool + operations (go-imap/v2)
+    imap/               - Connection pool + dedicated IDLE + operations (go-imap/v2)
+    notify/             - IMAP IDLE supervisor, leases, webhook POST
     smtp/               - Sending logic (jordan-wright/email)
     server/             - MCP server, Google auth, tool registration
     types/              - Shared domain types

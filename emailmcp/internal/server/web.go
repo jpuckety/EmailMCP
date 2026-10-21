@@ -29,37 +29,44 @@ type WebUser struct {
 
 // AccountPayload represents the request payload for creating/updating an account.
 type AccountPayload struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	IMAPHost     string `json:"imap_host"`
-	IMAPPort     int    `json:"imap_port"`
-	IMAPUsername string `json:"imap_username"`
-	IMAPPassword string `json:"imap_password,omitempty"`
-	IMAPUseTLS   *bool  `json:"imap_use_tls"`
-	SMTPHost     string `json:"smtp_host"`
-	SMTPPort     int    `json:"smtp_port"`
-	SMTPUsername string `json:"smtp_username,omitempty"`
-	SMTPPassword string `json:"smtp_password,omitempty"`
-	SMTPUseTLS   *bool  `json:"smtp_use_tls"`
-	FromAddress  string `json:"from_address,omitempty"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	IMAPHost          string   `json:"imap_host"`
+	IMAPPort          int      `json:"imap_port"`
+	IMAPUsername      string   `json:"imap_username"`
+	IMAPPassword      string   `json:"imap_password,omitempty"`
+	IMAPUseTLS        *bool    `json:"imap_use_tls"`
+	SMTPHost          string   `json:"smtp_host"`
+	SMTPPort          int      `json:"smtp_port"`
+	SMTPUsername      string   `json:"smtp_username,omitempty"`
+	SMTPPassword      string   `json:"smtp_password,omitempty"`
+	SMTPUseTLS        *bool    `json:"smtp_use_tls"`
+	FromAddress       string   `json:"from_address,omitempty"`
+	WebhookURL        *string  `json:"webhook_url"`
+	WebhookToken      string   `json:"webhook_token,omitempty"`
+	ClearWebhookToken bool     `json:"clear_webhook_token,omitempty"`
+	WatchFolders      []string `json:"watch_folders"`
 }
 
 // AccountResponse represents the account details returned to the frontend.
 type AccountResponse struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	IMAPHost     string `json:"imap_host"`
-	IMAPPort     int    `json:"imap_port"`
-	IMAPUsername string `json:"imap_username"`
-	IMAPUseTLS   bool   `json:"imap_use_tls"`
-	SMTPHost     string `json:"smtp_host"`
-	SMTPPort     int    `json:"smtp_port"`
-	SMTPUsername string `json:"smtp_username,omitempty"`
-	SMTPUseTLS   bool   `json:"smtp_use_tls"`
-	FromAddress  string `json:"from_address,omitempty"`
-	HasPassword  bool   `json:"has_password"`
-	CreatedAt    string `json:"created_at,omitempty"`
-	UpdatedAt    string `json:"updated_at,omitempty"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	IMAPHost        string   `json:"imap_host"`
+	IMAPPort        int      `json:"imap_port"`
+	IMAPUsername    string   `json:"imap_username"`
+	IMAPUseTLS      bool     `json:"imap_use_tls"`
+	SMTPHost        string   `json:"smtp_host"`
+	SMTPPort        int      `json:"smtp_port"`
+	SMTPUsername    string   `json:"smtp_username,omitempty"`
+	SMTPUseTLS      bool     `json:"smtp_use_tls"`
+	FromAddress     string   `json:"from_address,omitempty"`
+	HasPassword     bool     `json:"has_password"`
+	WebhookURL      string   `json:"webhook_url,omitempty"`
+	HasWebhookToken bool     `json:"has_webhook_token"`
+	WatchFolders    []string `json:"watch_folders,omitempty"`
+	CreatedAt       string   `json:"created_at,omitempty"`
+	UpdatedAt       string   `json:"updated_at,omitempty"`
 }
 
 func newAccountResponse(acc *types.Account) AccountResponse {
@@ -67,20 +74,23 @@ func newAccountResponse(acc *types.Account) AccountResponse {
 		return AccountResponse{}
 	}
 	return AccountResponse{
-		ID:           acc.ID,
-		Name:         acc.Name,
-		IMAPHost:     acc.IMAPHost,
-		IMAPPort:     acc.IMAPPort,
-		IMAPUsername: acc.IMAPUsername,
-		IMAPUseTLS:   acc.IMAPUseTLS,
-		SMTPHost:     acc.SMTPHost,
-		SMTPPort:     acc.SMTPPort,
-		SMTPUsername: acc.SMTPUsername,
-		SMTPUseTLS:   acc.SMTPUseTLS,
-		FromAddress:  acc.FromAddress,
-		HasPassword:  acc.IMAPPassword != "" || acc.SMTPPassword != "",
-		CreatedAt:    formatTime(acc.CreatedAt),
-		UpdatedAt:    formatTime(acc.UpdatedAt),
+		ID:              acc.ID,
+		Name:            acc.Name,
+		IMAPHost:        acc.IMAPHost,
+		IMAPPort:        acc.IMAPPort,
+		IMAPUsername:    acc.IMAPUsername,
+		IMAPUseTLS:      acc.IMAPUseTLS,
+		SMTPHost:        acc.SMTPHost,
+		SMTPPort:        acc.SMTPPort,
+		SMTPUsername:    acc.SMTPUsername,
+		SMTPUseTLS:      acc.SMTPUseTLS,
+		FromAddress:     acc.FromAddress,
+		HasPassword:     acc.IMAPPassword != "" || acc.SMTPPassword != "",
+		WebhookURL:      acc.WebhookURL,
+		HasWebhookToken: acc.WebhookToken != "",
+		WatchFolders:    append([]string(nil), acc.WatchFolders...),
+		CreatedAt:       formatTime(acc.CreatedAt),
+		UpdatedAt:       formatTime(acc.UpdatedAt),
 	}
 }
 
@@ -408,8 +418,13 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		SMTPUseTLS:   smtpUseTLS,
 		FromAddress:  payload.FromAddress,
 	}
+	applyWebhookPayload(acc, payload, false)
 
 	if err := validateAccountEndpoints(acc); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validateWebhookSettings(acc.WebhookURL, acc.WebhookToken, acc.WatchFolders); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
@@ -488,8 +503,13 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	if payload.FromAddress != "" {
 		existing.FromAddress = payload.FromAddress
 	}
+	applyWebhookPayload(existing, payload, true)
 
 	if err := validateAccountEndpoints(existing); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := validateWebhookSettings(existing.WebhookURL, existing.WebhookToken, existing.WatchFolders); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}

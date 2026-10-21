@@ -211,6 +211,9 @@ func TestAddEmailAccount_PreservesExistingPasswords(t *testing.T) {
 		IMAPPassword: "keep-imap",
 		SMTPHost:     "1.1.1.1",
 		SMTPPassword: "keep-smtp",
+		WebhookURL:   "https://8.8.8.8/hook",
+		WebhookToken: "keep-webhook",
+		WatchFolders: []string{"INBOX"},
 	}); err != nil {
 		t.Fatalf("PutUserConfig failed: %v", err)
 	}
@@ -235,6 +238,12 @@ func TestAddEmailAccount_PreservesExistingPasswords(t *testing.T) {
 	}
 	if acc.IMAPPassword != "keep-imap" || acc.SMTPPassword != "keep-smtp" {
 		t.Fatalf("expected existing passwords to be preserved, got imap=%q smtp=%q", acc.IMAPPassword, acc.SMTPPassword)
+	}
+	if acc.WebhookURL != "https://8.8.8.8/hook" || acc.WebhookToken != "keep-webhook" {
+		t.Fatalf("expected existing webhook secrets to be preserved, got url=%q token=%q", acc.WebhookURL, acc.WebhookToken)
+	}
+	if len(acc.WatchFolders) != 1 || acc.WatchFolders[0] != "INBOX" {
+		t.Fatalf("expected existing watch folders to be preserved, got %#v", acc.WatchFolders)
 	}
 }
 

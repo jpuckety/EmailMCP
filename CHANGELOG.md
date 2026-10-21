@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 — 2026-10-21
+
+### Added
+- IMAP IDLE push notifications: one HTTPS webhook per account, optional Bearer token, and watch folders (empty list = INBOX + special-use Sent).
+- Portal account form fields for webhook URL, write-only token (with remove-saved-token), and folders. Token is never returned on GET.
+- `email-mcp-notify` Fargate service (`-transport notify`) with a KMS-encrypted `NotifyState` table for leases and UID watermarks. Notify image is SSM `/email-mcp/notify/image-uri` so env-stack deploys do not reset a promoted digest.
+
 ## 0.2.0 — 2026-10-21
 
 ### Added

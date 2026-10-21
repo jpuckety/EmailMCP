@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -602,6 +603,560 @@ func TestAPIAccounts_VerifyUsesSavedAccount(t *testing.T) {
 	if !strings.Contains(res.IMAP.Error, "not allowed") {
 		t.Fatalf("expected IMAP SSRF error from stored host, got %q", res.IMAP.Error)
 	}
+}
+
+func TestAPIAccounts_WebhookSettings(t *testing.T) {
+	srv, token := newTestWebServerWithSession(t)
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	client := http.DefaultClient
+	useTLS := true
+	webhookURL := "https://8.8.8.8/notify"
+	createPayload := AccountPayload{
+		ID:           "notify-mail",
+		Name:         "Notify Mail",
+		IMAPHost:     "imap.fastmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "worker@fastmail.com",
+		IMAPPassword: "secret-imap-password",
+		IMAPUseTLS:   &useTLS,
+		SMTPHost:     "smtp.fastmail.com",
+		SMTPPort:     587,
+		SMTPUseTLS:   &useTLS,
+		WebhookURL:   &webhookURL,
+		WebhookToken: "webhook-secret",
+		WatchFolders: []string{"INBOX", "Sent"},
+	}
+	createJSON, _ := json.Marshal(createPayload)
+	reqCreate, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts", bytes.NewReader(createJSON))
+	reqCreate.Header.Set("Authorization", "Bearer "+token)
+	reqCreate.Header.Set("Content-Type", "application/json")
+	respCreate, err := client.Do(reqCreate)
+	if err != nil {
+		t.Fatalf("POST /api/accounts: %v", err)
+	}
+	defer respCreate.Body.Close()
+	createBody, _ := io.ReadAll(respCreate.Body)
+	if respCreate.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/accounts status = %d (want 201), body = %s", respCreate.StatusCode, createBody)
+	}
+	if strings.Contains(string(createBody), "webhook-secret") {
+		t.Fatalf("create response leaked webhook token: %s", createBody)
+	}
+	created := mustAccountMap(t, createBody)
+	if created["webhook_url"] != webhookURL {
+		t.Fatalf("expected webhook_url in create response, got %s", createBody)
+	}
+	if created["has_webhook_token"] != true {
+		t.Fatalf("expected has_webhook_token=true, got %s", createBody)
+	}
+	if _, ok := created["webhook_token"]; ok {
+		t.Fatalf("create response included webhook_token: %s", createBody)
+	}
+
+	reqGet, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/accounts/notify-mail", nil)
+	reqGet.Header.Set("Authorization", "Bearer "+token)
+	respGet, err := client.Do(reqGet)
+	if err != nil {
+		t.Fatalf("GET /api/accounts/notify-mail: %v", err)
+	}
+	getBody, _ := io.ReadAll(respGet.Body)
+	respGet.Body.Close()
+	if respGet.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d, body = %s", respGet.StatusCode, getBody)
+	}
+	if strings.Contains(string(getBody), "webhook-secret") {
+		t.Fatalf("GET leaked webhook token: %s", getBody)
+	}
+	got := mustAccountMap(t, getBody)
+	if got["webhook_url"] != webhookURL || got["has_webhook_token"] != true {
+		t.Fatalf("unexpected GET account: %s", getBody)
+	}
+	if _, ok := got["webhook_token"]; ok {
+		t.Fatalf("GET included webhook_token: %s", getBody)
+	}
+
+	reqList, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/accounts", nil)
+	reqList.Header.Set("Authorization", "Bearer "+token)
+	respList, err := client.Do(reqList)
+	if err != nil {
+		t.Fatalf("GET /api/accounts: %v", err)
+	}
+	listBody, _ := io.ReadAll(respList.Body)
+	respList.Body.Close()
+	if strings.Contains(string(listBody), "webhook-secret") {
+		t.Fatalf("list leaked webhook token: %s", listBody)
+	}
+	var listed struct {
+		Accounts []map[string]any `json:"accounts"`
+	}
+	if err := json.Unmarshal(listBody, &listed); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(listed.Accounts) != 1 {
+		t.Fatalf("expected 1 account, got %s", listBody)
+	}
+	if _, ok := listed.Accounts[0]["webhook_token"]; ok {
+		t.Fatalf("list included webhook_token: %s", listBody)
+	}
+	if listed.Accounts[0]["has_webhook_token"] != true {
+		t.Fatalf("expected has_webhook_token on list, got %s", listBody)
+	}
+
+	updatePayload := AccountPayload{
+		Name:         "Notify Mail Updated",
+		IMAPHost:     "imap.fastmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "worker@fastmail.com",
+		SMTPHost:     "smtp.fastmail.com",
+		SMTPPort:     587,
+		WebhookURL:   &webhookURL,
+		WebhookToken: "",
+	}
+	updateJSON, _ := json.Marshal(updatePayload)
+	reqUpdate, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/accounts/notify-mail", bytes.NewReader(updateJSON))
+	reqUpdate.Header.Set("Authorization", "Bearer "+token)
+	reqUpdate.Header.Set("Content-Type", "application/json")
+	respUpdate, err := client.Do(reqUpdate)
+	if err != nil {
+		t.Fatalf("PUT /api/accounts/notify-mail: %v", err)
+	}
+	updateBody, _ := io.ReadAll(respUpdate.Body)
+	respUpdate.Body.Close()
+	if respUpdate.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status = %d, body = %s", respUpdate.StatusCode, updateBody)
+	}
+	if strings.Contains(string(updateBody), "webhook-secret") {
+		t.Fatalf("update response leaked webhook token: %s", updateBody)
+	}
+
+	stored, err := srv.configStore.GetUserConfig(context.Background(), "user123", "notify-mail")
+	if err != nil {
+		t.Fatalf("GetUserConfig: %v", err)
+	}
+	if stored.WebhookToken != "webhook-secret" {
+		t.Fatalf("blank webhook_token on update should keep previous token, got %q", stored.WebhookToken)
+	}
+	if stored.Name != "Notify Mail Updated" {
+		t.Fatalf("name = %q, want updated", stored.Name)
+	}
+	if len(stored.WatchFolders) != 2 {
+		t.Fatalf("omitted watch_folders should keep previous list, got %#v", stored.WatchFolders)
+	}
+
+	cleared := ""
+	clearPayload := AccountPayload{
+		Name:       "Notify Mail Updated",
+		IMAPHost:   "imap.fastmail.com",
+		IMAPPort:   993,
+		SMTPHost:   "smtp.fastmail.com",
+		SMTPPort:   587,
+		WebhookURL: &cleared,
+	}
+	clearJSON, _ := json.Marshal(clearPayload)
+	reqClear, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/accounts/notify-mail", bytes.NewReader(clearJSON))
+	reqClear.Header.Set("Authorization", "Bearer "+token)
+	reqClear.Header.Set("Content-Type", "application/json")
+	respClear, err := client.Do(reqClear)
+	if err != nil {
+		t.Fatalf("PUT clear webhook: %v", err)
+	}
+	clearBody, _ := io.ReadAll(respClear.Body)
+	respClear.Body.Close()
+	if respClear.StatusCode != http.StatusOK {
+		t.Fatalf("PUT clear status = %d, body = %s", respClear.StatusCode, clearBody)
+	}
+	stored, err = srv.configStore.GetUserConfig(context.Background(), "user123", "notify-mail")
+	if err != nil {
+		t.Fatalf("GetUserConfig after clear: %v", err)
+	}
+	if stored.WebhookURL != "" {
+		t.Fatalf("expected webhook_url cleared, got %q", stored.WebhookURL)
+	}
+}
+
+func TestAPIAccounts_WebhookValidation(t *testing.T) {
+	srv, token := newTestWebServerWithSession(t)
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	client := http.DefaultClient
+	useTLS := true
+	base := AccountPayload{
+		Name:         "Notify Mail",
+		IMAPHost:     "imap.fastmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "worker@fastmail.com",
+		IMAPPassword: "secret-imap-password",
+		IMAPUseTLS:   &useTLS,
+		SMTPHost:     "smtp.fastmail.com",
+		SMTPPort:     587,
+		SMTPUseTLS:   &useTLS,
+	}
+
+	post := func(p AccountPayload) *http.Response {
+		t.Helper()
+		body, _ := json.Marshal(p)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST /api/accounts: %v", err)
+		}
+		return resp
+	}
+
+	httpURL := "http://8.8.8.8/notify"
+	httpPayload := base
+	httpPayload.ID = "http-hook"
+	httpPayload.WebhookURL = &httpURL
+	resp := post(httpPayload)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for http webhook, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	privateURL := "https://192.168.1.1/notify"
+	privatePayload := base
+	privatePayload.ID = "private-hook"
+	privatePayload.WebhookURL = &privateURL
+	resp = post(privatePayload)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for private webhook host, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	tooMany := base
+	tooMany.ID = "too-many-folders"
+	tooMany.WatchFolders = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}
+	resp = post(tooMany)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for more than 8 folders, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	emptyFolders := base
+	emptyFolders.ID = "default-folders"
+	emptyFolders.WatchFolders = []string{}
+	resp = post(emptyFolders)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("empty watch_folders should be accepted, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestAPIAccounts_WebhookPUTSemanticsAndValidation(t *testing.T) {
+	srv, token := newTestWebServerWithSession(t)
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	useTLS := true
+	webhookURL := "https://8.8.8.8/hook"
+	createPayload := AccountPayload{
+		ID:           "put-notify",
+		Name:         "PUT Notify",
+		IMAPHost:     "8.8.8.8",
+		IMAPPort:     993,
+		IMAPUsername: "worker@example.com",
+		IMAPPassword: "imap-secret",
+		IMAPUseTLS:   &useTLS,
+		SMTPHost:     "1.1.1.1",
+		SMTPPort:     587,
+		SMTPUseTLS:   &useTLS,
+		WebhookURL:   &webhookURL,
+		WebhookToken: "old-token",
+		WatchFolders: []string{"INBOX", "Sent"},
+	}
+	createBody, err := json.Marshal(createPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts", bytes.NewReader(createBody))
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", createResp.StatusCode)
+	}
+
+	put := func(payload AccountPayload) (int, []byte) {
+		t.Helper()
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal PUT payload: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPut, ts.URL+"/api/accounts/put-notify", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("build PUT request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("PUT account: %v", err)
+		}
+		defer resp.Body.Close()
+		responseBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read PUT response: %v", err)
+		}
+		return resp.StatusCode, responseBody
+	}
+
+	invalidURLs := []struct {
+		name string
+		url  string
+	}{
+		{name: "http scheme", url: "http://8.8.8.8/hook"},
+		{name: "private host", url: "https://192.168.1.1/hook"},
+		{name: "userinfo", url: "https://user:pass@8.8.8.8/hook"},
+	}
+	for _, tc := range invalidURLs {
+		t.Run("reject "+tc.name, func(t *testing.T) {
+			badURL := tc.url
+			status, body := put(AccountPayload{WebhookURL: &badURL})
+			if status != http.StatusBadRequest {
+				t.Fatalf("PUT status = %d, want 400: %s", status, body)
+			}
+			stored, err := srv.configStore.GetUserConfig(context.Background(), "user123", "put-notify")
+			if err != nil {
+				t.Fatalf("GetUserConfig after rejected PUT: %v", err)
+			}
+			if stored.WebhookURL != webhookURL || stored.WebhookToken != "old-token" || !reflect.DeepEqual(stored.WatchFolders, []string{"INBOX", "Sent"}) {
+				t.Fatalf("rejected PUT changed stored webhook settings: URL=%q token=%q folders=%#v", stored.WebhookURL, stored.WebhookToken, stored.WatchFolders)
+			}
+		})
+	}
+
+	tooManyFolders := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}
+	status, body := put(AccountPayload{WatchFolders: tooManyFolders})
+	if status != http.StatusBadRequest {
+		t.Fatalf("too-many-folders PUT status = %d, want 400: %s", status, body)
+	}
+	stored, err := srv.configStore.GetUserConfig(context.Background(), "user123", "put-notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WebhookURL != webhookURL || stored.WebhookToken != "old-token" || !reflect.DeepEqual(stored.WatchFolders, []string{"INBOX", "Sent"}) {
+		t.Fatalf("rejected folder PUT changed stored settings: URL=%q token=%q folders=%#v", stored.WebhookURL, stored.WebhookToken, stored.WatchFolders)
+	}
+
+	status, body = put(AccountPayload{WebhookToken: "replacement-token", WatchFolders: []string{" INBOX ", "inbox", "Sent", " Sent "}})
+	if status != http.StatusOK {
+		t.Fatalf("replace token PUT status = %d, want 200: %s", status, body)
+	}
+	stored, err = srv.configStore.GetUserConfig(context.Background(), "user123", "put-notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WebhookToken != "replacement-token" {
+		t.Fatalf("nonblank token should replace previous token, got %q", stored.WebhookToken)
+	}
+	if !reflect.DeepEqual(stored.WatchFolders, []string{"INBOX", "Sent"}) {
+		t.Fatalf("folders should be trimmed and deduplicated, got %#v", stored.WatchFolders)
+	}
+
+	status, body = put(AccountPayload{WatchFolders: []string{}})
+	if status != http.StatusOK {
+		t.Fatalf("empty folders PUT status = %d, want 200: %s", status, body)
+	}
+	stored, err = srv.configStore.GetUserConfig(context.Background(), "user123", "put-notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.WatchFolders) != 0 {
+		t.Fatalf("empty watch_folders should reset to defaults, got %#v", stored.WatchFolders)
+	}
+
+	status, body = put(AccountPayload{ClearWebhookToken: true})
+	if status != http.StatusOK {
+		t.Fatalf("explicit token clear PUT status = %d, want 200: %s", status, body)
+	}
+	stored, err = srv.configStore.GetUserConfig(context.Background(), "user123", "put-notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WebhookURL != webhookURL || stored.WebhookToken != "" {
+		t.Fatalf("explicit clear should retain URL and clear token, got URL=%q token=%q", stored.WebhookURL, stored.WebhookToken)
+	}
+
+	status, body = put(AccountPayload{WebhookToken: "origin-token"})
+	if status != http.StatusOK {
+		t.Fatalf("set token PUT status = %d, want 200: %s", status, body)
+	}
+	newOriginURL := "https://1.1.1.1/new-hook"
+	status, body = put(AccountPayload{WebhookURL: &newOriginURL})
+	if status != http.StatusOK {
+		t.Fatalf("change origin PUT status = %d, want 200: %s", status, body)
+	}
+	stored, err = srv.configStore.GetUserConfig(context.Background(), "user123", "put-notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WebhookURL != newOriginURL || stored.WebhookToken != "" {
+		t.Fatalf("origin change should clear stale token, got URL=%q token=%q", stored.WebhookURL, stored.WebhookToken)
+	}
+
+	status, body = put(AccountPayload{WebhookToken: "clear-on-remove"})
+	if status != http.StatusOK {
+		t.Fatalf("set token before removal PUT status = %d, want 200: %s", status, body)
+	}
+	clearURL := ""
+	status, body = put(AccountPayload{WebhookURL: &clearURL})
+	if status != http.StatusOK {
+		t.Fatalf("clear URL PUT status = %d, want 200: %s", status, body)
+	}
+	stored, err = srv.configStore.GetUserConfig(context.Background(), "user123", "put-notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WebhookURL != "" || stored.WebhookToken != "" {
+		t.Fatalf("clearing URL should clear token, got URL=%q token=%q", stored.WebhookURL, stored.WebhookToken)
+	}
+}
+
+func TestValidateWebhookSettings(t *testing.T) {
+	if err := validateWebhookSettings("", "", nil); err != nil {
+		t.Fatalf("empty webhook should be valid: %v", err)
+	}
+	if err := validateWebhookSettings("", "", []string{}); err != nil {
+		t.Fatalf("empty folders should be valid: %v", err)
+	}
+	if err := validateWebhookSettings("https://8.8.8.8/hook", "", []string{"INBOX"}); err != nil {
+		t.Fatalf("public https webhook should be valid: %v", err)
+	}
+	if err := validateWebhookSettings("http://8.8.8.8/hook", "", nil); err == nil {
+		t.Fatal("expected error for http webhook")
+	}
+	if err := validateWebhookSettings("https://192.168.0.5/hook", "", nil); err == nil {
+		t.Fatal("expected error for private webhook host")
+	}
+	if err := validateWebhookSettings("https://user:pass@8.8.8.8/hook", "", nil); err == nil {
+		t.Fatal("expected error for URL userinfo")
+	}
+	if err := validateWebhookSettings("", "", []string{"1", "2", "3", "4", "5", "6", "7", "8", "9"}); err == nil {
+		t.Fatal("expected error for more than 8 folders")
+	}
+	if err := validateWebhookSettings("", "secret", nil); err == nil {
+		t.Fatal("expected error for token without URL")
+	}
+}
+
+func TestAPIAccounts_WebhookOriginAndRetention(t *testing.T) {
+	srv, token := newTestWebServerWithSession(t)
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	do := func(method, path string, payload AccountPayload) (int, []byte) {
+		t.Helper()
+		b, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		req, err := http.NewRequest(method, ts.URL+path, bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, body
+	}
+	stored := func() *types.Account {
+		t.Helper()
+		acc, err := srv.configStore.GetUserConfig(context.Background(), "user123", "origin-test")
+		if err != nil {
+			t.Fatalf("GetUserConfig: %v", err)
+		}
+		return acc
+	}
+
+	useTLS := true
+	url1 := "https://8.8.8.8:443/hook"
+	status, body := do(http.MethodPost, "/api/accounts", AccountPayload{
+		ID:           "origin-test",
+		Name:         "Origin Test",
+		IMAPHost:     "1.1.1.1",
+		IMAPPort:     993,
+		IMAPUsername: "u",
+		IMAPPassword: "p",
+		IMAPUseTLS:   &useTLS,
+		SMTPHost:     "1.1.1.1",
+		SMTPPort:     587,
+		SMTPUseTLS:   &useTLS,
+		WebhookURL:   &url1,
+		WebhookToken: " my-token ",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("POST status = %d, body = %s", status, body)
+	}
+	if got := stored().WebhookToken; got != "my-token" {
+		t.Fatalf("token should be trimmed on create, got %q", got)
+	}
+
+	// Same origin (default port 443 == explicit 443), different path: token kept.
+	url2 := "https://8.8.8.8/other"
+	status, body = do(http.MethodPut, "/api/accounts/origin-test", AccountPayload{WebhookURL: &url2})
+	if status != http.StatusOK {
+		t.Fatalf("PUT same-origin status = %d, body = %s", status, body)
+	}
+	if got := stored(); got.WebhookURL != url2 || got.WebhookToken != "my-token" {
+		t.Fatalf("same-origin update should keep token, got URL=%q token=%q", got.WebhookURL, got.WebhookToken)
+	}
+
+	// Rejected: token without URL. Nothing may change.
+	url3 := ""
+	status, _ = do(http.MethodPut, "/api/accounts/origin-test", AccountPayload{WebhookURL: &url3, WebhookToken: "new-token"})
+	if status != http.StatusBadRequest {
+		t.Fatalf("expected 400 for token without URL, got %d", status)
+	}
+	if got := stored(); got.WebhookURL != url2 || got.WebhookToken != "my-token" {
+		t.Fatalf("rejected PUT changed config: URL=%q token=%q", got.WebhookURL, got.WebhookToken)
+	}
+
+	// Different port is a different origin: token cleared.
+	url4 := "https://8.8.8.8:8443/x"
+	status, body = do(http.MethodPut, "/api/accounts/origin-test", AccountPayload{WebhookURL: &url4})
+	if status != http.StatusOK {
+		t.Fatalf("PUT port change status = %d, body = %s", status, body)
+	}
+	if got := stored(); got.WebhookURL != url4 || got.WebhookToken != "" {
+		t.Fatalf("port change should clear token, got URL=%q token=%q", got.WebhookURL, got.WebhookToken)
+	}
+
+	// POST with token and no URL is rejected and not stored.
+	status, _ = do(http.MethodPost, "/api/accounts", AccountPayload{
+		ID: "no-url", Name: "No URL", IMAPHost: "1.1.1.1", IMAPPort: 993, IMAPUsername: "u",
+		IMAPPassword: "p", IMAPUseTLS: &useTLS, SMTPHost: "1.1.1.1", SMTPPort: 587,
+		SMTPUseTLS: &useTLS, WebhookToken: "orphan",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("expected 400 for POST token without URL, got %d", status)
+	}
+	if _, err := srv.configStore.GetUserConfig(context.Background(), "user123", "no-url"); err == nil {
+		t.Fatal("rejected POST must not persist account")
+	}
+}
+
+func mustAccountMap(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode account JSON: %v\nbody = %s", err, body)
+	}
+	return got
 }
 
 func TestAPILogout(t *testing.T) {

@@ -69,11 +69,11 @@ type pooledConn struct {
 
 // imapAccountConfig holds the connection info (password plaintext only briefly).
 type imapAccountConfig struct {
-	Host     string
-	Port     int
-	Username string
-	Password string
-	UseTLS   bool
+	Host               string
+	Port               int
+	Username           string
+	Password           string
+	UseTLS             bool
 	SkipHostValidation bool
 }
 
@@ -525,23 +525,7 @@ func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder s
 
 	summaries := make([]types.EmailSummary, 0, len(msgs))
 	for _, msg := range msgs {
-		summary := types.EmailSummary{
-			UID:   uint32(msg.UID),
-			Flags: flagStrings(msg.Flags),
-			Size:  uint32(msg.RFC822Size),
-		}
-		if msg.Envelope != nil {
-			summary.Subject = msg.Envelope.Subject
-			summary.From = convertAddresses(msg.Envelope.From)
-			summary.To = convertAddresses(msg.Envelope.To)
-			summary.Cc = convertAddresses(msg.Envelope.Cc)
-			summary.Date = msg.Envelope.Date
-		}
-		// Basic detection of attachments via body structure if present
-		if msg.BodyStructure != nil {
-			summary.HasAttach = hasAttachmentStructure(msg.BodyStructure)
-		}
-		summaries = append(summaries, summary)
+		summaries = append(summaries, summaryFromBuffer(msg))
 	}
 
 	if !limitBeforeFetch {
@@ -808,6 +792,28 @@ func (m *Manager) DeleteEmails(ctx context.Context, acc *types.Account, folder s
 }
 
 // Helper functions
+
+func summaryFromBuffer(msg *imapclient.FetchMessageBuffer) types.EmailSummary {
+	if msg == nil {
+		return types.EmailSummary{}
+	}
+	summary := types.EmailSummary{
+		UID:   uint32(msg.UID),
+		Flags: flagStrings(msg.Flags),
+		Size:  uint32(msg.RFC822Size),
+	}
+	if msg.Envelope != nil {
+		summary.Subject = msg.Envelope.Subject
+		summary.From = convertAddresses(msg.Envelope.From)
+		summary.To = convertAddresses(msg.Envelope.To)
+		summary.Cc = convertAddresses(msg.Envelope.Cc)
+		summary.Date = msg.Envelope.Date
+	}
+	if msg.BodyStructure != nil {
+		summary.HasAttach = hasAttachmentStructure(msg.BodyStructure)
+	}
+	return summary
+}
 
 func flagStrings(flags []imap.Flag) []string {
 	out := make([]string, len(flags))

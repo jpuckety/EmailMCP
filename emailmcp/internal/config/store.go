@@ -34,6 +34,9 @@ type Store interface {
 	GetUserConfig(ctx context.Context, userID, accountID string) (*types.Account, error)
 	// ListUserConfigs returns all accounts owned by the user (may be empty).
 	ListUserConfigs(ctx context.Context, userID string) ([]*types.Account, error)
+	// ListAllConfigs returns every account in the application partition.
+	// Used by the notify watcher to find accounts with a webhook URL.
+	ListAllConfigs(ctx context.Context) ([]*types.Account, error)
 	// PutUserConfig creates or replaces an account configuration.
 	PutUserConfig(ctx context.Context, userID string, acc *types.Account) error
 	// DeleteUserConfig removes an account, returning ErrConfigNotFound if absent.
@@ -96,24 +99,27 @@ type dynamoStore struct {
 // are stored as attributes; the table is encrypted at rest with the shared KMS
 // key. Timestamps are stored as Unix seconds.
 type accountItem struct {
-	ApplicationID string `dynamodbav:"applicationId"`
-	UserID        string `dynamodbav:"userId"`
-	ID            string `dynamodbav:"id"`
-	Name          string `dynamodbav:"name"`
-	IMAPHost      string `dynamodbav:"imap_host"`
-	IMAPPort      int    `dynamodbav:"imap_port"`
-	IMAPUsername  string `dynamodbav:"imap_username"`
-	IMAPPassword  string `dynamodbav:"imap_password"`
-	IMAPUseTLS    bool   `dynamodbav:"imap_use_tls"`
-	SMTPHost      string `dynamodbav:"smtp_host"`
-	SMTPPort      int    `dynamodbav:"smtp_port"`
-	SMTPUsername  string `dynamodbav:"smtp_username"`
-	SMTPPassword  string `dynamodbav:"smtp_password"`
-	SMTPUseTLS    bool   `dynamodbav:"smtp_use_tls"`
-	FromAddress   string `dynamodbav:"from_address"`
-	SaveToSent    string `dynamodbav:"save_to_sent,omitempty"`
-	CreatedAt     int64  `dynamodbav:"created_at"`
-	UpdatedAt     int64  `dynamodbav:"updated_at"`
+	ApplicationID string   `dynamodbav:"applicationId"`
+	UserID        string   `dynamodbav:"userId"`
+	ID            string   `dynamodbav:"id"`
+	Name          string   `dynamodbav:"name"`
+	IMAPHost      string   `dynamodbav:"imap_host"`
+	IMAPPort      int      `dynamodbav:"imap_port"`
+	IMAPUsername  string   `dynamodbav:"imap_username"`
+	IMAPPassword  string   `dynamodbav:"imap_password"`
+	IMAPUseTLS    bool     `dynamodbav:"imap_use_tls"`
+	SMTPHost      string   `dynamodbav:"smtp_host"`
+	SMTPPort      int      `dynamodbav:"smtp_port"`
+	SMTPUsername  string   `dynamodbav:"smtp_username"`
+	SMTPPassword  string   `dynamodbav:"smtp_password"`
+	SMTPUseTLS    bool     `dynamodbav:"smtp_use_tls"`
+	FromAddress   string   `dynamodbav:"from_address"`
+	SaveToSent    string   `dynamodbav:"save_to_sent,omitempty"`
+	WebhookURL    string   `dynamodbav:"webhook_url,omitempty"`
+	WebhookToken  string   `dynamodbav:"webhook_token,omitempty"`
+	WatchFolders  []string `dynamodbav:"watch_folders,omitempty"`
+	CreatedAt     int64    `dynamodbav:"created_at"`
+	UpdatedAt     int64    `dynamodbav:"updated_at"`
 }
 
 func newAccountItem(applicationID, userID string, acc *types.Account) accountItem {
@@ -138,6 +144,9 @@ func newAccountItem(applicationID, userID string, acc *types.Account) accountIte
 		SMTPUseTLS:    acc.SMTPUseTLS,
 		FromAddress:   acc.FromAddress,
 		SaveToSent:    acc.SaveToSent,
+		WebhookURL:    acc.WebhookURL,
+		WebhookToken:  acc.WebhookToken,
+		WatchFolders:  copyWatchFolders(acc.WatchFolders),
 	}
 }
 
@@ -157,6 +166,10 @@ func (it accountItem) toAccount() *types.Account {
 		SMTPUseTLS:   it.SMTPUseTLS,
 		FromAddress:  it.FromAddress,
 		SaveToSent:   it.SaveToSent,
+		WebhookURL:   it.WebhookURL,
+		WebhookToken: it.WebhookToken,
+		WatchFolders: copyWatchFolders(it.WatchFolders),
+		OwnerUserID:  ownerFromSortKey(it.UserID, it.ID),
 	}
 	// Fall back SMTP → IMAP password when a distinct SMTP password is unset.
 	if acc.SMTPPassword == "" {
@@ -236,6 +249,36 @@ func (d *dynamoStore) ListUserConfigs(ctx context.Context, userID string) ([]*ty
 	return accs, nil
 }
 
+func (d *dynamoStore) ListAllConfigs(ctx context.Context) ([]*types.Account, error) {
+	var accs []*types.Account
+	var startKey map[string]ddbtypes.AttributeValue
+	for {
+		out, err := d.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(d.tableName),
+			KeyConditionExpression: aws.String("applicationId = :app"),
+			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+				":app": &ddbtypes.AttributeValueMemberS{Value: d.applicationID},
+			},
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list all configs: %w", err)
+		}
+		for _, raw := range out.Items {
+			var it accountItem
+			if err := attributevalue.UnmarshalMap(raw, &it); err != nil {
+				return nil, fmt.Errorf("unmarshal user config: %w", err)
+			}
+			accs = append(accs, it.toAccount())
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
+	return accs, nil
+}
+
 func (d *dynamoStore) PutUserConfig(ctx context.Context, userID string, acc *types.Account) error {
 	now := time.Now().Unix()
 	created := now
@@ -293,8 +336,32 @@ func newMemoryStore() *memoryStore {
 }
 
 func cloneAccount(a *types.Account) *types.Account {
+	if a == nil {
+		return nil
+	}
 	cp := *a
+	cp.WatchFolders = copyWatchFolders(a.WatchFolders)
 	return &cp
+}
+
+func copyWatchFolders(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string(nil), in...)
+}
+
+func ownerFromSortKey(sk, accountID string) string {
+	if accountID != "" {
+		suffix := "#" + accountID
+		if strings.HasSuffix(sk, suffix) && len(sk) > len(suffix) {
+			return sk[:len(sk)-len(suffix)]
+		}
+	}
+	if i := strings.LastIndex(sk, "#"); i > 0 {
+		return sk[:i]
+	}
+	return ""
 }
 
 func (m *memoryStore) GetUserConfig(_ context.Context, userID, accountID string) (*types.Account, error) {
@@ -321,10 +388,27 @@ func (m *memoryStore) ListUserConfigs(_ context.Context, userID string) ([]*type
 	return accs, nil
 }
 
+func (m *memoryStore) ListAllConfigs(_ context.Context) ([]*types.Account, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	accs := make([]*types.Account, 0, len(m.items))
+	for _, a := range m.items {
+		accs = append(accs, cloneAccount(a))
+	}
+	sort.Slice(accs, func(i, j int) bool {
+		if accs[i].OwnerUserID != accs[j].OwnerUserID {
+			return accs[i].OwnerUserID < accs[j].OwnerUserID
+		}
+		return accs[i].ID < accs[j].ID
+	})
+	return accs, nil
+}
+
 func (m *memoryStore) PutUserConfig(_ context.Context, userID string, acc *types.Account) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := cloneAccount(acc)
+	cp.OwnerUserID = userID
 	if cp.SMTPPassword == "" {
 		cp.SMTPPassword = cp.IMAPPassword
 	}

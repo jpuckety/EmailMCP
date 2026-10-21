@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
@@ -25,10 +26,22 @@ func (m *Manager) FindSpecialUseFolder(ctx context.Context, acc *types.Account, 
 	hadErr := false
 	defer func() { m.Release(acc, conn, hadErr) }()
 
-	cmd := conn.client.List("", "*", &imap.ListOptions{ReturnSpecialUse: true})
-	mailboxes, err := cmd.Collect()
+	name, err := findSpecialUseFolder(conn.client, attr, fallbacks)
 	if err != nil {
 		hadErr = true
+		return "", err
+	}
+	logger.InfoContext(ctx, "found special-use folder", "folder", name)
+	return name, nil
+}
+
+func findSpecialUseFolder(client *imapclient.Client, attr imap.MailboxAttr, fallbacks []string) (string, error) {
+	if client == nil {
+		return "", fmt.Errorf("imap client is required")
+	}
+	cmd := client.List("", "*", &imap.ListOptions{ReturnSpecialUse: true})
+	mailboxes, err := cmd.Collect()
+	if err != nil {
 		return "", mapIMAPError("", fmt.Errorf("list mailboxes: %w", err))
 	}
 
@@ -36,7 +49,6 @@ func (m *Manager) FindSpecialUseFolder(ctx context.Context, acc *types.Account, 
 	for _, mb := range mailboxes {
 		for _, a := range mb.Attrs {
 			if strings.ToLower(string(a)) == want {
-				logger.InfoContext(ctx, "found special-use folder", "folder", mb.Mailbox)
 				return mb.Mailbox, nil
 			}
 		}
@@ -48,7 +60,6 @@ func (m *Manager) FindSpecialUseFolder(ctx context.Context, acc *types.Account, 
 	}
 	for _, candidate := range fallbacks {
 		if got, ok := names[strings.ToLower(candidate)]; ok {
-			logger.InfoContext(ctx, "found folder by name", "folder", got)
 			return got, nil
 		}
 	}

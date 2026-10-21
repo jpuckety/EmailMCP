@@ -29,7 +29,7 @@ type Config struct {
 	LogLevel string
 
 	// Transport
-	Transport string // "http" or "stdio"
+	Transport string // "http", "stdio", or "notify"
 
 	// Auth & remote account storage
 	ApplicationID  string
@@ -52,6 +52,20 @@ type Config struct {
 	// span replicas). Resolved from EMAILMCP_USER_CONFIG_TABLE or the SSM
 	// parameter /emailmcp/user-config-table/name.
 	UserConfigTableName string
+	// NotifyStateTableName is the DynamoDB table used by the notify watcher for
+	// folder leases and UID watermarks. Resolved from EMAILMCP_NOTIFY_STATE_TABLE
+	// or the SSM parameter /emailmcp/notify-state-table/name. Empty is allowed
+	// only for local/dev (in-memory leases); ECS fails closed.
+	NotifyStateTableName string
+	// NotifyOwnerID is the lease owner for this process. Empty means the notify
+	// transport generates a unique per-process id (never the shared "notify").
+	NotifyOwnerID string
+	// NotifyReconcileInterval is how often the watcher reloads accounts.
+	NotifyReconcileInterval time.Duration
+	// NotifyWebhookTimeout is the per-attempt timeout for outbound webhook POSTs.
+	NotifyWebhookTimeout time.Duration
+	// NotifyMaxFolders caps watched IMAP folders per account (hard max 8).
+	NotifyMaxFolders int
 	// OAuthRedirectAllowlist restricts HTTPS OAuth redirect_uris when non-empty.
 	// Entries are comma-separated hostnames (example.com, *.example.com) or
 	// https origins/URIs. Empty means the allowlist is not enforced (any HTTPS
@@ -60,34 +74,39 @@ type Config struct {
 	OAuthRedirectAllowlist []string
 
 	// Attachment / message limits
-	MaxAttachmentBytes int64
-	MaxMessageBytes    int64
-	AttachmentURLTimeout time.Duration
-	AttachmentAllowedHosts []string
-	AttachmentPathAllowlist []string
+	MaxAttachmentBytes       int64
+	MaxMessageBytes          int64
+	AttachmentURLTimeout     time.Duration
+	AttachmentAllowedHosts   []string
+	AttachmentPathAllowlist  []string
 	AttachmentInlineMaxBytes int64
-	AttachmentS3Bucket string
-	AttachmentS3Prefix string
-	AttachmentPresignTTL time.Duration
-	SaveToSentDefault string
+	AttachmentS3Bucket       string
+	AttachmentS3Prefix       string
+	AttachmentPresignTTL     time.Duration
+	SaveToSentDefault        string
 }
 
 // Load reads configuration from environment with sensible defaults.
 func Load() (*Config, error) {
 	cfg := &Config{
-		ListenAddr:             getEnv("EMAILMCP_LISTEN_ADDR", ":8080"),
-		IMAPMaxConnsPerAccount: getEnvInt("EMAILMCP_IMAP_MAX_CONNS", 4),
-		IMAPConnIdleTimeout:    getEnvDuration("EMAILMCP_IMAP_IDLE_TIMEOUT", 5*time.Minute),
-		SMTPDefaultTimeout:     getEnvDuration("EMAILMCP_SMTP_TIMEOUT", 30*time.Second),
-		LogLevel:               getEnv("EMAILMCP_LOG_LEVEL", "info"),
-		Transport:              getEnv("EMAILMCP_TRANSPORT", "http"),
-		ApplicationID:          getEnv("APPLICATION_ID", "default"),
-		GoogleClientID:         getEnv("GOOGLE_CLIENT_ID", ""),
-		GoogleClientSecret:     getEnv("GOOGLE_CLIENT_SECRET", ""),
-		PublicBaseURL:          strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/"),
-		SessionTableName:       getEnv("EMAILMCP_SESSION_TABLE", ""),
-		UserConfigTableName:    getEnv("EMAILMCP_USER_CONFIG_TABLE", ""),
-		OAuthRedirectAllowlist: parseCSVEnv("OAUTH_REDIRECT_ALLOWLIST"),
+		ListenAddr:               getEnv("EMAILMCP_LISTEN_ADDR", ":8080"),
+		IMAPMaxConnsPerAccount:   getEnvInt("EMAILMCP_IMAP_MAX_CONNS", 4),
+		IMAPConnIdleTimeout:      getEnvDuration("EMAILMCP_IMAP_IDLE_TIMEOUT", 5*time.Minute),
+		SMTPDefaultTimeout:       getEnvDuration("EMAILMCP_SMTP_TIMEOUT", 30*time.Second),
+		LogLevel:                 getEnv("EMAILMCP_LOG_LEVEL", "info"),
+		Transport:                getEnv("EMAILMCP_TRANSPORT", "http"),
+		ApplicationID:            getEnv("APPLICATION_ID", "default"),
+		GoogleClientID:           getEnv("GOOGLE_CLIENT_ID", ""),
+		GoogleClientSecret:       getEnv("GOOGLE_CLIENT_SECRET", ""),
+		PublicBaseURL:            strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/"),
+		SessionTableName:         getEnv("EMAILMCP_SESSION_TABLE", ""),
+		UserConfigTableName:      getEnv("EMAILMCP_USER_CONFIG_TABLE", ""),
+		NotifyStateTableName:     getEnv("EMAILMCP_NOTIFY_STATE_TABLE", ""),
+		NotifyOwnerID:            strings.TrimSpace(getEnv("EMAILMCP_NOTIFY_OWNER", "")),
+		NotifyReconcileInterval:  getEnvDuration("EMAILMCP_NOTIFY_RECONCILE", 30*time.Second),
+		NotifyWebhookTimeout:     getEnvDuration("EMAILMCP_NOTIFY_WEBHOOK_TIMEOUT", 10*time.Second),
+		NotifyMaxFolders:         getEnvInt("EMAILMCP_NOTIFY_MAX_FOLDERS", 8),
+		OAuthRedirectAllowlist:   parseCSVEnv("OAUTH_REDIRECT_ALLOWLIST"),
 		MaxAttachmentBytes:       getEnvInt64("EMAILMCP_ATTACHMENT_MAX_BYTES", 10<<20),
 		MaxMessageBytes:          getEnvInt64("EMAILMCP_MESSAGE_MAX_BYTES", 25<<20),
 		AttachmentURLTimeout:     getEnvDuration("EMAILMCP_ATTACHMENT_URL_TIMEOUT", 30*time.Second),
@@ -107,6 +126,28 @@ func Load() (*Config, error) {
 		cfg.IMAPMaxConnsPerAccount = 1
 	}
 
+	cfg.NotifyReconcileInterval = clampDuration(
+		cfg.NotifyReconcileInterval,
+		5*time.Second, 5*time.Minute, 30*time.Second,
+		"EMAILMCP_NOTIFY_RECONCILE",
+	)
+	cfg.NotifyWebhookTimeout = clampDuration(
+		cfg.NotifyWebhookTimeout,
+		time.Second, 30*time.Second, 10*time.Second,
+		"EMAILMCP_NOTIFY_WEBHOOK_TIMEOUT",
+	)
+	if cfg.NotifyMaxFolders < 1 {
+		slog.Warn("EMAILMCP_NOTIFY_MAX_FOLDERS < 1; clamping to 1",
+			"configured", cfg.NotifyMaxFolders,
+		)
+		cfg.NotifyMaxFolders = 1
+	} else if cfg.NotifyMaxFolders > 8 {
+		slog.Warn("EMAILMCP_NOTIFY_MAX_FOLDERS > 8; clamping to 8",
+			"configured", cfg.NotifyMaxFolders,
+		)
+		cfg.NotifyMaxFolders = 8
+	}
+
 	// Never log GoogleClientSecret or other secrets.
 	slog.Info("configuration loaded from environment",
 		"listen_addr", cfg.ListenAddr,
@@ -123,6 +164,12 @@ func Load() (*Config, error) {
 		"session_table", cfg.SessionTableName,
 		"user_config_table_set", cfg.UserConfigTableName != "",
 		"user_config_table", cfg.UserConfigTableName,
+		"notify_state_table_set", cfg.NotifyStateTableName != "",
+		"notify_state_table", cfg.NotifyStateTableName,
+		"notify_owner_set", cfg.NotifyOwnerID != "",
+		"notify_reconcile_interval", cfg.NotifyReconcileInterval,
+		"notify_webhook_timeout", cfg.NotifyWebhookTimeout,
+		"notify_max_folders", cfg.NotifyMaxFolders,
 		"oauth_redirect_allowlist_enforced", len(cfg.OAuthRedirectAllowlist) > 0,
 		"oauth_redirect_allowlist_entries", len(cfg.OAuthRedirectAllowlist),
 		"max_attachment_bytes", cfg.MaxAttachmentBytes,
@@ -143,10 +190,9 @@ func Load() (*Config, error) {
 func (c *Config) FetchRemoteDefaults(ctx context.Context) {
 	logger := slog.Default().With("op", "fetch_remote_defaults")
 
-	needSessionTable := c.SessionTableName == ""
-	needUserConfigTable := c.UserConfigTableName == ""
-	if !needSessionTable && !needUserConfigTable {
-		logger.DebugContext(ctx, "skipping SSM lookup; session and user config tables already set")
+	needSessionTable, needUserConfigTable, needNotifyStateTable := c.remoteParamsNeeded()
+	if !needSessionTable && !needUserConfigTable && !needNotifyStateTable {
+		logger.DebugContext(ctx, "skipping SSM lookup; required tables already set")
 		return
 	}
 
@@ -178,6 +224,24 @@ func (c *Config) FetchRemoteDefaults(ctx context.Context) {
 			logger.InfoContext(ctx, "user config table resolved from SSM", "user_config_table", v)
 		}
 	}
+	if needNotifyStateTable {
+		if v := getSSMParameter(ctx, client, "/emailmcp/notify-state-table/name", logger); v != "" {
+			c.NotifyStateTableName = v
+			logger.InfoContext(ctx, "notify state table resolved from SSM", "notify_state_table", v)
+		}
+	}
+}
+
+// remoteParamsNeeded decides which SSM lookups are required for the active
+// transport. The notify transport needs the user-config and notify-state
+// tables (not the session table); every other transport never resolves the
+// notify-state table, so HTTP/stdio startup makes no extra SSM calls.
+func (c *Config) remoteParamsNeeded() (session, userConfig, notifyState bool) {
+	userConfig = c.UserConfigTableName == ""
+	if c.Transport == "notify" {
+		return false, userConfig, c.NotifyStateTableName == ""
+	}
+	return c.SessionTableName == "", userConfig, false
 }
 
 // getSSMParameter reads a single SSM parameter, returning "" on any error or
@@ -258,6 +322,29 @@ func getEnvInt64(key string, def int64) int64 {
 		)
 	}
 	return def
+}
+
+func clampDuration(d, min, max, def time.Duration, name string) time.Duration {
+	if d <= 0 {
+		return def
+	}
+	if d < min {
+		slog.Warn("duration env var below minimum; clamping",
+			"key", name,
+			"configured", d,
+			"min", min,
+		)
+		return min
+	}
+	if d > max {
+		slog.Warn("duration env var above maximum; clamping",
+			"key", name,
+			"configured", d,
+			"max", max,
+		)
+		return max
+	}
+	return d
 }
 
 func getEnvDuration(key string, def time.Duration) time.Duration {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -574,13 +575,17 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		accountID = "default"
 	}
 
-	// Passwords are set only via the user portal. Preserve any already stored
-	// credentials when this tool replaces an existing account.
-	var imapPass, smtpPass, saveToSent string
+	// Passwords and webhook secrets are set only via the user portal. Preserve
+	// any already stored credentials when this tool replaces an existing account.
+	var imapPass, smtpPass, saveToSent, webhookURL, webhookToken string
+	var watchFolders []string
 	if existing, err := s.configStore.GetUserConfig(ctx, user.Subject, accountID); err == nil && existing != nil {
 		imapPass = existing.IMAPPassword
 		smtpPass = existing.SMTPPassword
 		saveToSent = existing.SaveToSent
+		webhookURL = existing.WebhookURL
+		webhookToken = existing.WebhookToken
+		watchFolders = append([]string(nil), existing.WatchFolders...)
 	}
 	if in.SaveToSent != "" {
 		saveToSent = in.SaveToSent
@@ -602,6 +607,9 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		SMTPUseTLS:   smtpUseTLS,
 		FromAddress:  in.FromAddress,
 		SaveToSent:   saveToSent,
+		WebhookURL:   webhookURL,
+		WebhookToken: webhookToken,
+		WatchFolders: watchFolders,
 	}
 
 	if err := s.configStore.PutUserConfig(ctx, user.Subject, acc); err != nil {
@@ -982,6 +990,89 @@ func validateAccountEndpoints(acc *types.Account) error {
 	}
 	if err := netutil.RequireTLSUnlessLocalhost(acc.SMTPHost, acc.SMTPUseTLS, "SMTP"); err != nil {
 		return err
+	}
+	return nil
+}
+
+func applyWebhookPayload(acc *types.Account, payload AccountPayload, keepExistingToken bool) {
+	previousURL := acc.WebhookURL
+	if payload.WebhookURL != nil {
+		acc.WebhookURL = strings.TrimSpace(*payload.WebhookURL)
+	}
+	token := strings.TrimSpace(payload.WebhookToken)
+	if token != "" {
+		acc.WebhookToken = token
+	} else if payload.ClearWebhookToken || !keepExistingToken || (acc.WebhookURL == "" && token == "") || (acc.WebhookURL != "" && webhookOrigin(previousURL) != webhookOrigin(acc.WebhookURL) && token == "") {
+		acc.WebhookToken = ""
+	}
+	if payload.WatchFolders != nil {
+		acc.WatchFolders = normalizeWatchFolders(payload.WatchFolders)
+	}
+}
+
+func normalizeWatchFolders(folders []string) []string {
+	result := make([]string, 0, len(folders))
+	seen := make(map[string]struct{}, len(folders))
+	for _, folder := range folders {
+		folder = strings.TrimSpace(folder)
+		key := folder
+		if strings.EqualFold(folder, "INBOX") {
+			folder = "INBOX"
+			key = "INBOX"
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, folder)
+	}
+	return result
+}
+
+func webhookOrigin(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		if strings.EqualFold(u.Scheme, "https") {
+			port = "443"
+		} else if strings.EqualFold(u.Scheme, "http") {
+			port = "80"
+		}
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Hostname()) + ":" + port
+}
+
+func validateWebhookSettings(webhookURL string, webhookToken string, folders []string) error {
+	if len(folders) > types.MaxWatchFolders {
+		return fmt.Errorf("watch_folders: at most %d folders allowed", types.MaxWatchFolders)
+	}
+	for i, folder := range folders {
+		if strings.TrimSpace(folder) == "" {
+			return fmt.Errorf("watch_folders[%d]: folder name must not be empty", i)
+		}
+	}
+	webhookURL = strings.TrimSpace(webhookURL)
+	if webhookURL == "" {
+		if strings.TrimSpace(webhookToken) != "" {
+			return fmt.Errorf("webhook_token supplied without webhook_url")
+		}
+		return nil
+	}
+	u, err := url.Parse(webhookURL)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("webhook_url is not a valid URL")
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("webhook_url must be https")
+	}
+	if u.User != nil {
+		return fmt.Errorf("webhook_url must not include user information")
+	}
+	if err := netutil.ValidatePublicHost(u.Hostname()); err != nil {
+		return fmt.Errorf("webhook_url not allowed: %w", err)
 	}
 	return nil
 }

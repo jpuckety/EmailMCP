@@ -39,7 +39,20 @@ type Account struct {
 	// SaveToSent controls whether send_email APPENDs a copy to the Sent folder.
 	// Values: "auto" (default), "true", "false".
 	SaveToSent string `json:"save_to_sent,omitempty"`
+
+	// WebhookURL is an optional HTTPS endpoint that receives envelope-only
+	// notifications for new mail. Empty disables watching for this account.
+	WebhookURL string `json:"webhook_url,omitempty"`
+	// WebhookToken is an optional Bearer token sent with webhook POSTs.
+	// It is stored like IMAPPassword and must never be returned on GET/list.
+	WebhookToken string `json:"webhook_token,omitempty"`
+	// WatchFolders is the explicit IMAP folder list to IDLE. Empty means the
+	// watcher should default to INBOX and Sent at watch time.
+	WatchFolders []string `json:"watch_folders,omitempty"`
 }
+
+// MaxWatchFolders is the maximum number of IMAP folders an account may watch.
+const MaxWatchFolders = 8
 
 // AccountSummary is a safe view without any credential material.
 type AccountSummary struct {

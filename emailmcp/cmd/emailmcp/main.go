@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	transportFlag := flag.String("transport", "", "transport mode: http or stdio")
+	transportFlag := flag.String("transport", "", "transport mode: http, stdio, or notify")
 	flag.Parse()
 
 	lvl := new(slog.LevelVar)
@@ -45,6 +45,15 @@ func main() {
 
 	// Resolve DynamoDB table names from SSM when not set in the environment.
 	cfg.FetchRemoteDefaults(ctx)
+
+	if cfg.Transport == "notify" {
+		if err := runNotify(ctx, cfg, logger); err != nil {
+			logger.Error("notify transport error", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("server stopped")
+		return
+	}
 
 	srv, err := server.New(ctx, cfg)
 	if err != nil {
