@@ -1,10 +1,13 @@
 package imap
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/mail"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +28,8 @@ type Config struct {
 	MaxConnsPerAccount int
 	IdleTimeout        time.Duration
 	Logger             *slog.Logger
+	// SkipHostValidation allows loopback IMAP in tests. Never enable in production.
+	SkipHostValidation bool
 }
 
 // Manager manages per-account IMAP connection pools.
@@ -69,6 +74,7 @@ type imapAccountConfig struct {
 	Username string
 	Password string
 	UseTLS   bool
+	SkipHostValidation bool
 }
 
 // NewManager creates an IMAP connection manager.
@@ -119,8 +125,10 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 	if acc.IMAPPassword == "" {
 		return nil, errors.New("imap password is required")
 	}
-	if err := netutil.ValidatePublicHost(acc.IMAPHost); err != nil {
-		return nil, fmt.Errorf("imap host not allowed: %w", err)
+	if !m.cfg.SkipHostValidation {
+		if err := netutil.ValidatePublicHost(acc.IMAPHost); err != nil {
+			return nil, fmt.Errorf("imap host not allowed: %w", err)
+		}
 	}
 	if err := netutil.RequireTLSUnlessLocalhost(acc.IMAPHost, acc.IMAPUseTLS, "IMAP"); err != nil {
 		return nil, err
@@ -131,11 +139,12 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 		ownerID:   acc.OwnerUserID,
 		accountID: acc.ID,
 		imapCfg: imapAccountConfig{
-			Host:     acc.IMAPHost,
-			Port:     acc.IMAPPort,
-			Username: acc.IMAPUsername,
-			Password: acc.IMAPPassword,
-			UseTLS:   acc.IMAPUseTLS,
+			Host:               acc.IMAPHost,
+			Port:               acc.IMAPPort,
+			Username:           acc.IMAPUsername,
+			Password:           acc.IMAPPassword,
+			UseTLS:             acc.IMAPUseTLS,
+			SkipHostValidation: m.cfg.SkipHostValidation,
 		},
 		maxConns: m.cfg.MaxConnsPerAccount,
 		idleT:    m.cfg.IdleTimeout,
@@ -276,8 +285,10 @@ func (p *accountPool) acquire(ctx context.Context) (*pooledConn, error) {
 
 func (p *accountPool) dialAndLogin(ctx context.Context) (*pooledConn, error) {
 	// Re-check at dial time so a pool cannot be abused if validation rules tighten.
-	if err := netutil.ValidatePublicHost(p.imapCfg.Host); err != nil {
-		return nil, fmt.Errorf("imap host not allowed: %w", err)
+	if !p.imapCfg.SkipHostValidation {
+		if err := netutil.ValidatePublicHost(p.imapCfg.Host); err != nil {
+			return nil, fmt.Errorf("imap host not allowed: %w", err)
+		}
 	}
 	if err := netutil.RequireTLSUnlessLocalhost(p.imapCfg.Host, p.imapCfg.UseTLS, "IMAP"); err != nil {
 		return nil, err
@@ -314,7 +325,7 @@ func (p *accountPool) dialAndLogin(ctx context.Context) (*pooledConn, error) {
 		logger.ErrorContext(ctx, "imap login failed",
 			"error", err, "username", p.imapCfg.Username, "elapsed", time.Since(start))
 		client.Close()
-		return nil, fmt.Errorf("imap login: %w", err)
+		return nil, types.AuthFailed("IMAP", err)
 	}
 
 	logger.InfoContext(ctx, "imap connection established",
@@ -613,17 +624,18 @@ func (m *Manager) GetEmail(ctx context.Context, acc *types.Account, folder strin
 	if err != nil {
 		hadErr = true
 		logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
-		return nil, fmt.Errorf("select %s: %w", folder, err)
+		return nil, mapIMAPError(folder, fmt.Errorf("select %s: %w", folder, err))
 	}
 	conn.lastSelected = folder
 
-	// Fetch full body + envelope + structure
+	// Fetch full body + envelope + structure + headers (Message-ID, References).
 	opts := &imap.FetchOptions{
 		Envelope:      true,
 		Flags:         true,
 		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
 		BodySection: []*imap.FetchItemBodySection{
-			{Specifier: imap.PartSpecifierText},
+			{Specifier: imap.PartSpecifierHeader, Peek: true},
+			{Specifier: imap.PartSpecifierText, Peek: true},
 		},
 		RFC822Size: true,
 	}
@@ -649,24 +661,34 @@ func (m *Manager) GetEmail(ctx context.Context, acc *types.Account, folder strin
 		Folder: folder,
 	}
 
+	em.Headers = map[string]string{}
 	if msg.Envelope != nil {
 		em.Subject = msg.Envelope.Subject
 		em.From = convertAddresses(msg.Envelope.From)
 		em.To = convertAddresses(msg.Envelope.To)
+		em.Cc = convertAddresses(msg.Envelope.Cc)
 		em.Date = msg.Envelope.Date
+		if msg.Envelope.MessageID != "" {
+			em.Headers["Message-ID"] = msg.Envelope.MessageID
+		}
+		if len(msg.Envelope.InReplyTo) > 0 {
+			em.Headers["In-Reply-To"] = strings.Join(msg.Envelope.InReplyTo, " ")
+		}
 	}
 
-	// Extract text/html from body sections. For simplicity we take the first text section.
-	// A more robust implementation would walk the body structure.
 	for _, bs := range msg.BodySection {
-		if len(bs.Bytes) > 0 {
-			// Very naive: prefer html if looks like it, else text.
-			content := string(bs.Bytes)
-			if em.HTML == "" && (len(content) > 20 && content[0] == '<') {
-				em.HTML = content
-			} else if em.Text == "" {
-				em.Text = content
-			}
+		if len(bs.Bytes) == 0 {
+			continue
+		}
+		if bs.Section != nil && bs.Section.Specifier == imap.PartSpecifierHeader {
+			parseMessageHeaders(em, bs.Bytes)
+			continue
+		}
+		content := string(bs.Bytes)
+		if em.HTML == "" && looksLikeHTML(content) {
+			em.HTML = content
+		} else if em.Text == "" {
+			em.Text = content
 		}
 	}
 
@@ -811,40 +833,31 @@ func uidsToUIDs(uids []uint32) []imap.UID {
 	return res
 }
 
-func hasAttachmentStructure(bs imap.BodyStructure) bool {
-	if bs == nil {
+func looksLikeHTML(content string) bool {
+	s := strings.TrimSpace(content)
+	if s == "" {
 		return false
 	}
-	has := false
-	bs.Walk(func(_ []int, part imap.BodyStructure) bool {
-		if disp := part.Disposition(); disp != nil {
-			if disp.Value == "attachment" || (disp.Value == "inline" && disp.Params["filename"] != "") {
-				has = true
-				return false // found one
-			}
-		}
-		return true
-	})
-	return has
+	l := strings.ToLower(s)
+	return strings.HasPrefix(l, "<html") || strings.HasPrefix(l, "<!doctype") ||
+		strings.Contains(l, "<html") || strings.Contains(l, "<body") || strings.Contains(l, "<div")
 }
 
-func extractAttachments(bs imap.BodyStructure) []types.Attachment {
-	var atts []types.Attachment
-	if bs == nil {
-		return atts
+func parseMessageHeaders(em *types.EmailMessage, raw []byte) {
+	if em.Headers == nil {
+		em.Headers = map[string]string{}
 	}
-	bs.Walk(func(path []int, part imap.BodyStructure) bool {
-		if disp := part.Disposition(); disp != nil {
-			if disp.Value == "attachment" || (disp.Value == "inline" && disp.Params["filename"] != "") {
-				filename := disp.Params["filename"]
-				atts = append(atts, types.Attachment{
-					Filename:    filename,
-					ContentType: part.MediaType(),
-					Size:        0, // size not directly on interface, skip detailed for now
-				})
-			}
+	// Header block only; add a dummy body so net/mail can parse.
+	if !bytes.Contains(raw, []byte("\r\n\r\n")) && !bytes.Contains(raw, []byte("\n\n")) {
+		raw = append(append([]byte{}, raw...), []byte("\r\n\r\n")...)
+	}
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return
+	}
+	for _, k := range []string{"Message-ID", "In-Reply-To", "References", "Reply-To"} {
+		if v := msg.Header.Get(k); v != "" {
+			em.Headers[k] = v
 		}
-		return true
-	})
-	return atts
+	}
 }
