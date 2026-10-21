@@ -12,8 +12,10 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/attach"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/config"
 	imapmgr "github.com/jpuckett/EmailMCP/emailmcp/internal/imap"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/mailbuild"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/netutil"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/smtp"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
@@ -24,6 +26,8 @@ type Server struct {
 	mcpServer     *mcp.Server
 	imapMgr       *imapmgr.Manager
 	smtpSend      *smtp.Sender
+	attachFetch   *attach.Fetcher
+	attachStore   attach.ObjectStore
 	logger        *slog.Logger
 	cfg           *config.Config
 	authenticator *Authenticator
@@ -45,13 +49,22 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	imapMgr := imapmgr.NewManager(imapCfg)
 	smtpSender := smtp.NewSender(smtp.Config{
-		DefaultTimeout: cfg.SMTPDefaultTimeout,
-		Logger:         slog.Default(),
+		DefaultTimeout:  cfg.SMTPDefaultTimeout,
+		Logger:          slog.Default(),
+		MaxMessageBytes: cfg.MaxMessageBytes,
+	})
+
+	attachFetch := attach.NewFetcher(attach.Config{
+		MaxBytes:      cfg.MaxAttachmentBytes,
+		Timeout:       cfg.AttachmentURLTimeout,
+		AllowedHosts:  cfg.AttachmentAllowedHosts,
+		PathAllowlist: cfg.AttachmentPathAllowlist,
+		Logger:        slog.Default(),
 	})
 
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "emailmcp",
-		Version: "0.1.0",
+		Version: "0.2.0",
 	}, nil)
 
 	logger := slog.Default()
@@ -99,10 +112,21 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create user config store: %w", err)
 	}
 
+	var attachStore attach.ObjectStore
+	if cfg.AttachmentS3Bucket != "" {
+		store, err := attach.NewS3Store(ctx, cfg.AttachmentS3Bucket, cfg.AttachmentS3Prefix, cfg.AttachmentPresignTTL, logger)
+		if err != nil {
+			return nil, fmt.Errorf("attachment s3 store: %w", err)
+		}
+		attachStore = store
+	}
+
 	es := &Server{
 		mcpServer:     srv,
 		imapMgr:       imapMgr,
 		smtpSend:      smtpSender,
+		attachFetch:   attachFetch,
+		attachStore:   attachStore,
 		logger:        logger,
 		cfg:           cfg,
 		authenticator: auth,
@@ -110,7 +134,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		configStore:   configStore,
 	}
 
-	es.logger.Info("initializing EmailMCP server", "name", "emailmcp", "version", "0.1.0")
+	es.logger.Info("initializing EmailMCP server", "name", "emailmcp", "version", "0.2.0")
 	if oauth != nil {
 		es.logger.Info("oauth authorization server enabled",
 			"issuer", cfg.PublicBaseURL,
@@ -361,8 +385,10 @@ func (s *Server) registerTools() {
 	}, s.searchEmails)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "read_email",
-		Description: "Read a single email by UID including text/HTML body and attachment metadata.",
+		Name: "read_email",
+		Description: "Read a single email by UID including text/HTML body and attachment metadata " +
+			"(id/part_id, filename, content_type, size, disposition, content_id, inline). " +
+			"Use get_attachment to fetch attachment bytes.",
 	}, s.readEmail)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -380,11 +406,28 @@ func (s *Server) registerTools() {
 		Description: "Delete one or more emails by marking them \\Deleted.",
 	}, s.deleteEmails)
 
-	// SMTP
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "send_email",
-		Description: "Send an email (supports plain text, HTML, and attachments as base64).",
+		Name: "get_attachment",
+		Description: "Fetch one attachment from a message by attachment_id/part_id or filename. " +
+			"Returns base64 data when under the inline size cap, otherwise a short-lived presigned URL if S3 is configured.",
+	}, s.getAttachment)
+
+	// SMTP / drafts
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name: "send_email",
+		Description: "Send an email now (plain text, HTML, attachments). " +
+			"Attachments may be inline base64 (data), an HTTPS URL (url, e.g. a presigned S3 link), or a local path (path, disabled unless allowlisted). " +
+			"Use create_draft instead when the user should review or edit before sending — create_draft never sends. " +
+			"Optional reply_to_uid/forward_uid set threading headers and can re-attach the original files server-side.",
 	}, s.sendEmail)
+
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name: "create_draft",
+		Description: "Save a complete email to the account Drafts folder with the \\Draft flag. Never sends. " +
+			"Use this when the user wants to review or finish the message later. " +
+			"Accepts the same body, recipients, attachments (data/url/path), reply, and forward options as send_email. " +
+			"Optional folder overrides Drafts discovery (SPECIAL-USE \\Drafts, then Drafts / INBOX.Drafts).",
+	}, s.createDraft)
 }
 
 // --- Input structs (for schema) ---
@@ -404,6 +447,7 @@ type AddAccountInput struct {
 	SMTPUseTLS   *bool  `json:"smtp_use_tls,omitempty" jsonschema:"default:true"`
 
 	FromAddress string `json:"from_address,omitempty"`
+	SaveToSent  string `json:"save_to_sent,omitempty" jsonschema:"Whether send_email should IMAP-APPEND a Sent copy: auto (default), true, or false"`
 }
 
 type AccountIDInput struct {
@@ -456,14 +500,37 @@ type DeleteEmailsInput struct {
 
 type SendEmailToolInput struct {
 	AccountID   string                  `json:"account_id"`
-	To          []string                `json:"to"`
+	To          []string                `json:"to,omitempty" jsonschema:"Recipients. Optional when reply_to_uid is set."`
 	Cc          []string                `json:"cc,omitempty"`
 	Bcc         []string                `json:"bcc,omitempty"`
-	Subject     string                  `json:"subject"`
+	Subject     string                  `json:"subject,omitempty" jsonschema:"Subject. Defaults to Re:/Fwd: of the original when replying or forwarding."`
 	Text        string                  `json:"text,omitempty"`
 	HTML        string                  `json:"html,omitempty"`
 	From        string                  `json:"from,omitempty"`
-	Attachments []types.AttachmentInput `json:"attachments,omitempty"`
+	Attachments []types.AttachmentInput `json:"attachments,omitempty" jsonschema:"Each item must provide exactly one of data (base64), url (https), or path (allowlisted local file). Optional content_id + disposition=inline for cid: images."`
+
+	ReplyToUID                 uint32 `json:"reply_to_uid,omitempty" jsonschema:"UID of the message to reply to. Sets In-Reply-To and References."`
+	ReplyFolder                string `json:"reply_folder,omitempty" jsonschema:"Folder of the message being replied to (default INBOX)"`
+	ReplyAll                   bool   `json:"reply_all,omitempty" jsonschema:"Fill To/Cc from the original minus the sender's own address"`
+	ForwardUID                 uint32 `json:"forward_uid,omitempty" jsonschema:"UID of the message to forward"`
+	ForwardFolder              string `json:"forward_folder,omitempty"`
+	IncludeOriginalAttachments *bool  `json:"include_original_attachments,omitempty" jsonschema:"When forwarding, re-attach original attachments server-side (default true)"`
+	QuoteOriginal              bool   `json:"quote_original,omitempty" jsonschema:"Quote the original body below the new text"`
+	SaveToSent                 string `json:"save_to_sent,omitempty" jsonschema:"auto (default), true, or false. auto saves a Sent copy except for Gmail which already does."`
+}
+
+type CreateDraftInput struct {
+	SendEmailToolInput
+	Folder string `json:"folder,omitempty" jsonschema:"Override Drafts folder. Default: SPECIAL-USE \\Drafts, then Drafts / INBOX.Drafts"`
+}
+
+type GetAttachmentInput struct {
+	AccountID    string `json:"account_id"`
+	Folder       string `json:"folder,omitempty" jsonschema:"Folder, defaults to INBOX"`
+	UID          uint32 `json:"uid"`
+	AttachmentID string `json:"attachment_id,omitempty" jsonschema:"Stable id from read_email (same as part_id)"`
+	PartID       string `json:"part_id,omitempty"`
+	Filename     string `json:"filename,omitempty"`
 }
 
 // --- Handlers ---
@@ -509,10 +576,14 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 
 	// Passwords are set only via the user portal. Preserve any already stored
 	// credentials when this tool replaces an existing account.
-	var imapPass, smtpPass string
+	var imapPass, smtpPass, saveToSent string
 	if existing, err := s.configStore.GetUserConfig(ctx, user.Subject, accountID); err == nil && existing != nil {
 		imapPass = existing.IMAPPassword
 		smtpPass = existing.SMTPPassword
+		saveToSent = existing.SaveToSent
+	}
+	if in.SaveToSent != "" {
+		saveToSent = in.SaveToSent
 	}
 
 	acc := &types.Account{
@@ -530,6 +601,7 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		SMTPPassword: smtpPass,
 		SMTPUseTLS:   smtpUseTLS,
 		FromAddress:  in.FromAddress,
+		SaveToSent:   saveToSent,
 	}
 
 	if err := s.configStore.PutUserConfig(ctx, user.Subject, acc); err != nil {
@@ -733,21 +805,130 @@ func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in Sen
 		return nil, nil, err
 	}
 
-	sendInput := types.SendEmailInput{
-		To:          in.To,
-		Cc:          in.Cc,
-		Bcc:         in.Bcc,
-		Subject:     in.Subject,
-		Text:        in.Text,
-		HTML:        in.HTML,
-		From:        in.From,
-		Attachments: in.Attachments,
-	}
-
-	if err := s.smtpSend.SendEmail(ctx, acc, sendInput); err != nil {
+	msg, err := s.composeMessage(ctx, acc, composeFromSend(in), false)
+	if err != nil {
 		return nil, nil, err
 	}
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Email sent successfully"}}}, nil, nil
+	raw, err := mailbuild.BuildWithLimits(msg, s.buildLimits(acc))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	recipients := append(append([]string{}, msg.To...), msg.Cc...)
+	recipients = append(recipients, msg.Bcc...)
+	result, err := s.smtpSend.SendRaw(ctx, acc, msg.From, recipients, raw, msg.MessageID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if smtp.ShouldSaveToSent(s.saveToSentMode(acc, in.SaveToSent), acc.SMTPHost) {
+		if app, appErr := s.imapMgr.AppendSent(ctx, acc, raw); appErr != nil {
+			s.logger.Info("save to sent failed", "account_id", acc.ID, "error", appErr)
+		} else if app != nil {
+			result.SavedToSent = true
+			result.SentFolder = app.Folder
+		}
+	}
+
+	text := fmt.Sprintf("Email sent. Message-ID: %s", result.MessageID)
+	if len(result.Rejected) > 0 {
+		text += fmt.Sprintf(" (%d recipient(s) rejected)", len(result.Rejected))
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, result, nil
+}
+
+func (s *Server) createDraft(ctx context.Context, req *mcp.CallToolRequest, in CreateDraftInput) (*mcp.CallToolResult, any, error) {
+	acc, err := s.getAccount(ctx, in.AccountID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	msg, err := s.composeMessage(ctx, acc, composeFromSend(in.SendEmailToolInput), true)
+	if err != nil {
+		return nil, nil, err
+	}
+	raw, err := mailbuild.BuildWithLimits(msg, s.buildLimits(acc))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	app, err := s.imapMgr.AppendDraft(ctx, acc, in.Folder, raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := types.DraftResult{
+		Folder:    app.Folder,
+		UID:       app.UID,
+		MessageID: msg.MessageID,
+	}
+	s.logger.Info("draft created", "account_id", acc.ID, "folder", out.Folder, "uid", out.UID, "size", len(raw))
+	text := fmt.Sprintf("Draft saved to %s", out.Folder)
+	if out.UID != 0 {
+		text += fmt.Sprintf(" (UID %d)", out.UID)
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+}
+
+func (s *Server) getAttachment(ctx context.Context, req *mcp.CallToolRequest, in GetAttachmentInput) (*mcp.CallToolResult, any, error) {
+	acc, err := s.getAccount(ctx, in.AccountID)
+	if err != nil {
+		return nil, nil, err
+	}
+	partID := in.AttachmentID
+	if partID == "" {
+		partID = in.PartID
+	}
+	fetched, err := s.imapMgr.GetAttachment(ctx, acc, in.Folder, in.UID, partID, in.Filename)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	out := types.AttachmentContent{
+		Filename:    fetched.Filename,
+		ContentType: fetched.ContentType,
+		Size:        fetched.Size,
+	}
+	inlineMax := int64(1 << 20)
+	if s.cfg != nil && s.cfg.AttachmentInlineMaxBytes > 0 {
+		inlineMax = s.cfg.AttachmentInlineMaxBytes
+	}
+	if fetched.Size <= inlineMax {
+		out.Data = encodeInline(fetched.Content)
+		return nil, out, nil
+	}
+	if s.attachStore != nil {
+		url, err := s.attachStore.PutAndPresign(ctx, fetched.Filename, fetched.ContentType, fetched.Content)
+		if err != nil {
+			return nil, nil, types.AttachmentFetchFailed(fetched.Filename, err)
+		}
+		out.URL = url
+		return nil, out, nil
+	}
+	return nil, nil, types.NewError(types.CodeAttachmentTooLarge,
+		fmt.Sprintf("attachment is %d bytes which exceeds the inline cap of %d bytes; configure EMAILMCP_ATTACHMENT_S3_BUCKET for a download URL", fetched.Size, inlineMax),
+		map[string]any{"actual_bytes": fetched.Size, "limit_bytes": inlineMax, "filename": fetched.Filename})
+}
+
+func composeFromSend(in SendEmailToolInput) ComposeInput {
+	return ComposeInput{
+		AccountID:                  in.AccountID,
+		To:                         in.To,
+		Cc:                         in.Cc,
+		Bcc:                        in.Bcc,
+		Subject:                    in.Subject,
+		Text:                       in.Text,
+		HTML:                       in.HTML,
+		From:                       in.From,
+		Attachments:                in.Attachments,
+		ReplyToUID:                 in.ReplyToUID,
+		ReplyFolder:                in.ReplyFolder,
+		ReplyAll:                   in.ReplyAll,
+		ForwardUID:                 in.ForwardUID,
+		ForwardFolder:              in.ForwardFolder,
+		IncludeOriginalAttachments: in.IncludeOriginalAttachments,
+		QuoteOriginal:              in.QuoteOriginal,
+		SaveToSent:                 in.SaveToSent,
+	}
 }
 
 // --- Helpers ---
