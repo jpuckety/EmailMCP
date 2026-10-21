@@ -35,6 +35,10 @@ type Account struct {
 
 	// Default sender address (optional). Falls back to SMTPUsername if empty.
 	FromAddress string `json:"from_address,omitempty"`
+
+	// SaveToSent controls whether send_email APPENDs a copy to the Sent folder.
+	// Values: "auto" (default), "true", "false".
+	SaveToSent string `json:"save_to_sent,omitempty"`
 }
 
 // AccountSummary is a safe view without any credential material.

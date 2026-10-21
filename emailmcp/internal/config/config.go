@@ -58,6 +58,18 @@ type Config struct {
 	// host is still accepted subject to other redirect rules). Loopback HTTP and
 	// custom schemes are always allowed for desktop MCP clients.
 	OAuthRedirectAllowlist []string
+
+	// Attachment / message limits
+	MaxAttachmentBytes int64
+	MaxMessageBytes    int64
+	AttachmentURLTimeout time.Duration
+	AttachmentAllowedHosts []string
+	AttachmentPathAllowlist []string
+	AttachmentInlineMaxBytes int64
+	AttachmentS3Bucket string
+	AttachmentS3Prefix string
+	AttachmentPresignTTL time.Duration
+	SaveToSentDefault string
 }
 
 // Load reads configuration from environment with sensible defaults.
@@ -76,6 +88,16 @@ func Load() (*Config, error) {
 		SessionTableName:       getEnv("EMAILMCP_SESSION_TABLE", ""),
 		UserConfigTableName:    getEnv("EMAILMCP_USER_CONFIG_TABLE", ""),
 		OAuthRedirectAllowlist: parseCSVEnv("OAUTH_REDIRECT_ALLOWLIST"),
+		MaxAttachmentBytes:       getEnvInt64("EMAILMCP_ATTACHMENT_MAX_BYTES", 10<<20),
+		MaxMessageBytes:          getEnvInt64("EMAILMCP_MESSAGE_MAX_BYTES", 25<<20),
+		AttachmentURLTimeout:     getEnvDuration("EMAILMCP_ATTACHMENT_URL_TIMEOUT", 30*time.Second),
+		AttachmentAllowedHosts:   parseCSVEnv("EMAILMCP_ATTACHMENT_ALLOWED_HOSTS"),
+		AttachmentPathAllowlist:  parseCSVEnv("EMAILMCP_ATTACHMENT_PATH_ALLOWLIST"),
+		AttachmentInlineMaxBytes: getEnvInt64("EMAILMCP_ATTACHMENT_INLINE_MAX", 1<<20),
+		AttachmentS3Bucket:       getEnv("EMAILMCP_ATTACHMENT_S3_BUCKET", ""),
+		AttachmentS3Prefix:       getEnv("EMAILMCP_ATTACHMENT_S3_PREFIX", "emailmcp-attachments/"),
+		AttachmentPresignTTL:     getEnvDuration("EMAILMCP_ATTACHMENT_PRESIGN_TTL", 15*time.Minute),
+		SaveToSentDefault:        getEnv("EMAILMCP_SAVE_TO_SENT", "auto"),
 	}
 
 	if cfg.IMAPMaxConnsPerAccount < 1 {
@@ -103,6 +125,14 @@ func Load() (*Config, error) {
 		"user_config_table", cfg.UserConfigTableName,
 		"oauth_redirect_allowlist_enforced", len(cfg.OAuthRedirectAllowlist) > 0,
 		"oauth_redirect_allowlist_entries", len(cfg.OAuthRedirectAllowlist),
+		"max_attachment_bytes", cfg.MaxAttachmentBytes,
+		"max_message_bytes", cfg.MaxMessageBytes,
+		"attachment_url_timeout", cfg.AttachmentURLTimeout,
+		"attachment_allowed_hosts", len(cfg.AttachmentAllowedHosts),
+		"attachment_path_allowlist", len(cfg.AttachmentPathAllowlist),
+		"attachment_inline_max", cfg.AttachmentInlineMaxBytes,
+		"attachment_s3_bucket_set", cfg.AttachmentS3Bucket != "",
+		"save_to_sent_default", cfg.SaveToSentDefault,
 		"aws_region", os.Getenv("AWS_REGION"),
 	)
 
@@ -205,6 +235,20 @@ func parseCSVEnv(key string) []string {
 func getEnvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+		slog.Warn("invalid integer env var; using default",
+			"key", key,
+			"value", v,
+			"default", def,
+		)
+	}
+	return def
+}
+
+func getEnvInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return i
 		}
 		slog.Warn("invalid integer env var; using default",

@@ -111,6 +111,7 @@ type accountItem struct {
 	SMTPPassword  string `dynamodbav:"smtp_password"`
 	SMTPUseTLS    bool   `dynamodbav:"smtp_use_tls"`
 	FromAddress   string `dynamodbav:"from_address"`
+	SaveToSent    string `dynamodbav:"save_to_sent,omitempty"`
 	CreatedAt     int64  `dynamodbav:"created_at"`
 	UpdatedAt     int64  `dynamodbav:"updated_at"`
 }
@@ -136,6 +137,7 @@ func newAccountItem(applicationID, userID string, acc *types.Account) accountIte
 		SMTPPassword:  smtpPass,
 		SMTPUseTLS:    acc.SMTPUseTLS,
 		FromAddress:   acc.FromAddress,
+		SaveToSent:    acc.SaveToSent,
 	}
 }
 
@@ -154,6 +156,7 @@ func (it accountItem) toAccount() *types.Account {
 		SMTPPassword: it.SMTPPassword,
 		SMTPUseTLS:   it.SMTPUseTLS,
 		FromAddress:  it.FromAddress,
+		SaveToSent:   it.SaveToSent,
 	}
 	// Fall back SMTP → IMAP password when a distinct SMTP password is unset.
 	if acc.SMTPPassword == "" {
