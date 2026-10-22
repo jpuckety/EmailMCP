@@ -39,10 +39,10 @@ func ForwardSubject(original string) string {
 func BuildReferences(originalRefs, originalMessageID string) string {
 	id := strings.TrimSpace(originalMessageID)
 	if id == "" {
-		return strings.TrimSpace(originalRefs)
+		return formatMessageIDs(originalRefs)
 	}
 	id = ensureAngle(id)
-	refs := strings.TrimSpace(originalRefs)
+	refs := formatMessageIDs(originalRefs)
 	if refs == "" {
 		return id
 	}
@@ -223,10 +223,10 @@ func ApplyForward(msg *Message, orig *types.EmailMessage, quote bool) {
 func origMessageID(orig *types.EmailMessage) string {
 	if orig.Headers != nil {
 		if v := orig.Headers["Message-ID"]; v != "" {
-			return v
+			return ensureAngle(v)
 		}
 		if v := orig.Headers["Message-Id"]; v != "" {
-			return v
+			return ensureAngle(v)
 		}
 	}
 	return ""

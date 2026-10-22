@@ -132,3 +132,76 @@ func TestAuthenticatedMCPFlow_PublicHost(t *testing.T) {
 		t.Fatalf("expected JSON response, got Content-Type %q body %s", ct, body2)
 	}
 }
+
+// TestConcurrentToolCallsSameJSONRPCID reproduces mailbox mixing: two POSTs on
+// the same MCP session that reuse jsonrpc id=2. Each HTTP response must contain
+// only its own result.
+func TestConcurrentToolCallsSameJSONRPCID(t *testing.T) {
+	srv, token := newTestServerWithSession(t)
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	resp1, body1 := doMCP(t, ts.URL+"/", token, "", initBody, "")
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("initialize status = %d, body = %s", resp1.StatusCode, body1)
+	}
+	sid := resp1.Header.Get("Mcp-Session-Id")
+	if sid == "" {
+		t.Fatalf("no Mcp-Session-Id returned; body = %s", body1)
+	}
+
+	pingBody := `{"jsonrpc":"2.0","id":2,"method":"ping"}`
+	type outcome struct {
+		status int
+		body   string
+		err    error
+	}
+	ch := make(chan outcome, 2)
+	post := func(body string) {
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/", bytes.NewReader([]byte(body)))
+		if err != nil {
+			ch <- outcome{err: err}
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("MCP-Protocol-Version", "2025-06-18")
+		req.Header.Set("Mcp-Session-Id", sid)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			ch <- outcome{err: err}
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		ch <- outcome{status: resp.StatusCode, body: string(b)}
+	}
+
+	go post(pingBody)
+	go post(toolsCallBody)
+
+	var bodies []string
+	for i := 0; i < 2; i++ {
+		o := <-ch
+		if o.err != nil {
+			t.Fatalf("request failed: %v", o.err)
+		}
+		if o.status != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", o.status, o.body)
+		}
+		bodies = append(bodies, o.body)
+	}
+
+	hasAccounts, hasPingOnly := 0, 0
+	for _, b := range bodies {
+		if strings.Contains(b, `"accounts"`) {
+			hasAccounts++
+			continue
+		}
+		hasPingOnly++
+	}
+	if hasAccounts != 1 || hasPingOnly != 1 {
+		t.Fatalf("concurrent responses mixed or lost: %v", bodies)
+	}
+}

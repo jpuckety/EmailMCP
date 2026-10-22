@@ -172,8 +172,12 @@ func (s *Server) HTTPHandler() http.Handler {
 		return s.mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Logger: s.logger,
-		// Return one JSON-RPC body per HTTP POST so concurrent tool calls on the
-		// same MCP session cannot have their SSE streams cross-wired.
+		// Each HTTP POST gets its own temporary MCP session. The SDK otherwise
+		// multiplexes concurrent POSTs on one session by JSON-RPC id, so two
+		// tools/call requests that reuse id=2 can receive each other's results
+		// (one times out; the other shows the wrong mailbox).
+		Stateless: true,
+		// Return one JSON-RPC body per HTTP POST rather than an SSE stream.
 		JSONResponse: true,
 		// DNS-rebinding / "localhost" protection is auto-enabled by the SDK and
 		// rejects any request whose connection has a loopback *local* address but
@@ -759,7 +763,7 @@ func (s *Server) searchEmails(ctx context.Context, req *mcp.CallToolRequest, in 
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, map[string]any{"emails": summaries}, nil
+	return nil, map[string]any{"account_id": acc.ID, "emails": summaries}, nil
 }
 
 func (s *Server) readEmail(ctx context.Context, req *mcp.CallToolRequest, in ReadEmailInput) (*mcp.CallToolResult, any, error) {

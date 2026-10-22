@@ -700,6 +700,9 @@ func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder s
 	if err != nil {
 		return nil, err
 	}
+	for i := range summaries {
+		summaries[i].AccountID = acc.ID
+	}
 
 	logger.InfoContext(ctx, "search complete",
 		"total_matches", totalMatches, "returned", len(summaries), "elapsed", time.Since(start))
@@ -805,27 +808,36 @@ func (m *Manager) GetEmail(ctx context.Context, acc *types.Account, folder strin
 			em.Cc = convertAddresses(msg.Envelope.Cc)
 			em.Date = msg.Envelope.Date
 			if msg.Envelope.MessageID != "" {
-				em.Headers["Message-ID"] = msg.Envelope.MessageID
+				em.Headers["Message-ID"] = angleMessageIDs(msg.Envelope.MessageID)
 			}
 			if len(msg.Envelope.InReplyTo) > 0 {
-				em.Headers["In-Reply-To"] = strings.Join(msg.Envelope.InReplyTo, " ")
+				em.Headers["In-Reply-To"] = angleMessageIDs(strings.Join(msg.Envelope.InReplyTo, " "))
 			}
 		}
 
+		em.AccountID = acc.ID
+
+		var headerBytes, bodyBytes []byte
+		appliedFull := false
 		for _, bs := range msg.BodySection {
 			if len(bs.Bytes) == 0 {
 				continue
 			}
-			if bs.Section != nil && bs.Section.Specifier == imap.PartSpecifierHeader {
-				parseMessageHeaders(em, bs.Bytes)
+			if bs.Section == nil || (bs.Section.Specifier == "" && len(bs.Section.Part) == 0) {
+				applyRFC822(em, bs.Bytes)
+				appliedFull = true
+				break
+			}
+			if bs.Section.Specifier == imap.PartSpecifierHeader {
+				headerBytes = bs.Bytes
 				continue
 			}
-			content := string(bs.Bytes)
-			if em.HTML == "" && looksLikeHTML(content) {
-				em.HTML = content
-			} else if em.Text == "" {
-				em.Text = content
+			if bs.Section.Specifier == imap.PartSpecifierText {
+				bodyBytes = bs.Bytes
 			}
+		}
+		if !appliedFull {
+			applyFetchedSections(em, headerBytes, bodyBytes)
 		}
 
 		if msg.BodyStructure != nil {
@@ -987,16 +999,6 @@ func uidsToUIDs(uids []uint32) []imap.UID {
 	return res
 }
 
-func looksLikeHTML(content string) bool {
-	s := strings.TrimSpace(content)
-	if s == "" {
-		return false
-	}
-	l := strings.ToLower(s)
-	return strings.HasPrefix(l, "<html") || strings.HasPrefix(l, "<!doctype") ||
-		strings.Contains(l, "<html") || strings.Contains(l, "<body") || strings.Contains(l, "<div")
-}
-
 func parseMessageHeaders(em *types.EmailMessage, raw []byte) {
 	if em.Headers == nil {
 		em.Headers = map[string]string{}
@@ -1011,7 +1013,11 @@ func parseMessageHeaders(em *types.EmailMessage, raw []byte) {
 	}
 	for _, k := range []string{"Message-ID", "In-Reply-To", "References", "Reply-To"} {
 		if v := msg.Header.Get(k); v != "" {
-			em.Headers[k] = v
+			if k == "Reply-To" {
+				em.Headers[k] = v
+			} else {
+				em.Headers[k] = angleMessageIDs(v)
+			}
 		}
 	}
 }

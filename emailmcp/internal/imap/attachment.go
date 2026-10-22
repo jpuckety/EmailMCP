@@ -239,7 +239,7 @@ func extractAttachments(bs imap.BodyStructure) []types.Attachment {
 			PartID:      id,
 			Filename:    filename,
 			ContentType: media,
-			Size:        int64(sp.Size),
+			Size:        decodedPartSize(sp.Encoding, sp.Size),
 			Disposition: disp,
 			ContentID:   cid,
 			Inline:      inline || cid != "",
@@ -251,4 +251,15 @@ func extractAttachments(bs imap.BodyStructure) []types.Attachment {
 
 func hasAttachmentStructure(bs imap.BodyStructure) bool {
 	return len(extractAttachments(bs)) > 0
+}
+
+// decodedPartSize converts IMAP BODYSTRUCTURE size (transfer-encoded octets)
+// to the decoded byte count when the encoding is known.
+func decodedPartSize(encoding string, n uint32) int64 {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "base64":
+		return int64(n / 4 * 3)
+	default:
+		return int64(n)
+	}
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 — 2026-10-22
+
+### Fixed
+- MCP Streamable HTTP is now stateless, so concurrent tool calls no longer share a session keyed by JSON-RPC id (parallel searches can no longer return the other account's mailbox).
+- `read_email` returns decoded text/html bodies instead of the raw MIME payload (boundaries and base64 attachments).
+- Attachment `size` on `read_email` is the decoded byte count, matching `get_attachment`.
+- Outgoing `Message-ID` / `In-Reply-To` / `References` are always written with angle brackets.
+
 ## 0.3.1 — 2026-10-22
 
 ### Fixed

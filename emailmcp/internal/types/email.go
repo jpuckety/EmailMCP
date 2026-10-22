@@ -12,6 +12,7 @@ type Folder struct {
 
 // EmailSummary provides header-level information for an email.
 type EmailSummary struct {
+	AccountID string    `json:"account_id,omitempty"`
 	UID       uint32    `json:"uid"`
 	SeqNum    uint32    `json:"seq_num,omitempty"`
 	Subject   string    `json:"subject"`
@@ -69,14 +70,14 @@ type SendEmailInput struct {
 
 	Attachments []AttachmentInput `json:"attachments,omitempty"`
 
-	ReplyToUID   uint32 `json:"reply_to_uid,omitempty"`
-	ReplyFolder  string `json:"reply_folder,omitempty"`
-	ReplyAll     bool   `json:"reply_all,omitempty"`
-	ForwardUID   uint32 `json:"forward_uid,omitempty"`
-	ForwardFolder string `json:"forward_folder,omitempty"`
-	IncludeOriginalAttachments *bool `json:"include_original_attachments,omitempty"`
-	QuoteOriginal bool   `json:"quote_original,omitempty"`
-	SaveToSent   string `json:"save_to_sent,omitempty"` // auto, true, false
+	ReplyToUID                 uint32 `json:"reply_to_uid,omitempty"`
+	ReplyFolder                string `json:"reply_folder,omitempty"`
+	ReplyAll                   bool   `json:"reply_all,omitempty"`
+	ForwardUID                 uint32 `json:"forward_uid,omitempty"`
+	ForwardFolder              string `json:"forward_folder,omitempty"`
+	IncludeOriginalAttachments *bool  `json:"include_original_attachments,omitempty"`
+	QuoteOriginal              bool   `json:"quote_original,omitempty"`
+	SaveToSent                 string `json:"save_to_sent,omitempty"` // auto, true, false
 }
 
 // AttachmentInput for sending. Provide exactly one of data, url, or path.
@@ -92,11 +93,11 @@ type AttachmentInput struct {
 
 // SendResult is returned after a successful SMTP send.
 type SendResult struct {
-	MessageID  string   `json:"message_id"`
-	Accepted   []string `json:"accepted"`
-	Rejected   []string `json:"rejected,omitempty"`
-	SavedToSent bool    `json:"saved_to_sent,omitempty"`
-	SentFolder string   `json:"sent_folder,omitempty"`
+	MessageID   string   `json:"message_id"`
+	Accepted    []string `json:"accepted"`
+	Rejected    []string `json:"rejected,omitempty"`
+	SavedToSent bool     `json:"saved_to_sent,omitempty"`
+	SentFolder  string   `json:"sent_folder,omitempty"`
 }
 
 // DraftResult is returned after create_draft.

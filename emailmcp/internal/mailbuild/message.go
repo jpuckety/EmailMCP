@@ -91,7 +91,7 @@ func Build(m Message) ([]byte, error) {
 		writeHeader(&out, "In-Reply-To", ensureAngle(m.InReplyTo))
 	}
 	if m.References != "" {
-		writeHeader(&out, "References", sanitizeHeader(m.References))
+		writeHeader(&out, "References", formatMessageIDs(m.References))
 	}
 	writeHeader(&out, "MIME-Version", "1.0")
 	for _, h := range b.extraHeaders {
@@ -400,6 +400,17 @@ func ensureAngle(s string) string {
 		s += ">"
 	}
 	return s
+}
+
+func formatMessageIDs(s string) string {
+	fields := strings.Fields(sanitizeHeader(s))
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if a := ensureAngle(f); a != "" {
+			out = append(out, a)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 func generateMessageID(from string) string {

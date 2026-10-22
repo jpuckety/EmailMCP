@@ -42,3 +42,28 @@ func TestExtractAttachments_PartIDAndInline(t *testing.T) {
 		t.Fatal("expected has attachments")
 	}
 }
+
+func TestExtractAttachments_Base64SizeIsDecoded(t *testing.T) {
+	bs := &goimap.BodyStructureMultiPart{
+		Subtype: "mixed",
+		Children: []goimap.BodyStructure{
+			&goimap.BodyStructureSinglePart{Type: "text", Subtype: "plain"},
+			&goimap.BodyStructureSinglePart{
+				Type: "text", Subtype: "plain", Encoding: "base64", Size: 40,
+				Extended: &goimap.BodyStructureSinglePartExt{
+					Disposition: &goimap.BodyStructureDisposition{
+						Value:  "attachment",
+						Params: map[string]string{"filename": "note.txt"},
+					},
+				},
+			},
+		},
+	}
+	atts := extractAttachments(bs)
+	if len(atts) != 1 {
+		t.Fatalf("got %d atts: %+v", len(atts), atts)
+	}
+	if atts[0].Size != 30 {
+		t.Fatalf("size=%d want 30 (decoded from 40-byte base64)", atts[0].Size)
+	}
+}

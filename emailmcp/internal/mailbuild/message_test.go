@@ -174,6 +174,43 @@ func TestBuildWithLimits(t *testing.T) {
 	_ = te
 }
 
+func TestBuild_MessageIDsHaveAngleBrackets(t *testing.T) {
+	raw, err := Build(Message{
+		From:       "a@example.com",
+		To:         []string{"b@example.com"},
+		Subject:    "Hi",
+		Text:       "hello",
+		MessageID:  "abc@example.com",
+		InReplyTo:  "prev@example.com",
+		References: "one@example.com two@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := parseMsg(t, raw)
+	if got := msg.Header.Get("Message-ID"); got != "<abc@example.com>" {
+		t.Fatalf("Message-ID=%q", got)
+	}
+	if got := msg.Header.Get("In-Reply-To"); got != "<prev@example.com>" {
+		t.Fatalf("In-Reply-To=%q", got)
+	}
+	if got := msg.Header.Get("References"); got != "<one@example.com> <two@example.com>" {
+		t.Fatalf("References=%q", got)
+	}
+	raw2, err := Build(Message{From: "a@example.com", To: []string{"b@example.com"}, Text: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg2 := parseMsg(t, raw2)
+	if msg2.Header.Get("In-Reply-To") != "" || msg2.Header.Get("References") != "" {
+		t.Fatalf("new messages must not set reply headers: %v", msg2.Header)
+	}
+	mid := msg2.Header.Get("Message-ID")
+	if !strings.HasPrefix(mid, "<") || !strings.HasSuffix(mid, ">") {
+		t.Fatalf("generated Message-ID missing brackets: %q", mid)
+	}
+}
+
 func TestSanitizeFilename(t *testing.T) {
 	if SanitizeFilename("../etc/passwd") != "passwd" {
 		t.Fatal(SanitizeFilename("../etc/passwd"))
