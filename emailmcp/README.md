@@ -32,7 +32,7 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 
 ## Requirements
 
-- Go 1.25+ (due to MCP SDK)
+- Go 1.26+
 - Node.js & npm (for CDK infrastructure)
 - AWS CLI configured with appropriate credentials
 - Google OAuth2 Client ID

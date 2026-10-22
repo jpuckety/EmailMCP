@@ -11,6 +11,8 @@ go.work.sum
 # EmailMCP subproject local files (if they appear at root somehow)
 emailmcp.db*
 .env
+.env.*
+!.env.example
 
 # Build / dist
 emailmcp-config-api/dist/

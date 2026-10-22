@@ -17,7 +17,7 @@ RUN npm run build
 # ============================================================================
 # Build stage: compile a static Go binary from emailmcp/.
 # ============================================================================
-FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/golang:1.26-alpine AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 

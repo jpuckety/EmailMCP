@@ -11,9 +11,11 @@ Storage is **DynamoDB** (durable, default) or **in-memory** (fallback). IMAP/SMT
 credentials live as attributes on the user-config table, encrypted at rest with a
 customer-managed KMS key.
 
-AWS deploy, image promotion, and SSM secrets are owned by
+AWS deploy and image promotion are owned by
 [MCPCICD](https://github.com/jpuckety/MCPCICD). This repo is the application plus
 the env CloudFormation stack (`EmailMcpStack`) that MCPCICD deploys into Dev/Prod.
+SSM Google OAuth secrets for this app are `./run.sh push-secrets-dev` /
+`push-secrets-prod`.
 
 ## Layout
 
@@ -36,6 +38,9 @@ the env CloudFormation stack (`EmailMcpStack`) that MCPCICD deploys into Dev/Pro
 
 Copy [emailmcp/.env.example](emailmcp/.env.example) to `emailmcp/.env` for local
 HTTP mode (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`).
+For AWS, copy [`.env.example`](.env.example) to `.env.dev` / `.env.prod` and run
+`./run.sh push-secrets-dev` / `push-secrets-prod` (credentials for that env
+account, or `DEV_PROFILE` / `PROD_PROFILE`).
 
 PRs run GitHub Actions only (`go test ./...` + `docker build`). Merges to
 `master` are released by the MCPCICD pipeline named `email-mcp`.
@@ -52,7 +57,8 @@ MCPCICD expects:
   `TASK_FAMILY = 'email-mcp'`
 - `cdk/scripts/prepare-taskdef.js`
 - Container `email-mcp` on port `8080` with `GET /health`
-- SSM SecureString parameters in each env account:
+- SSM SecureString parameters in each env account (push from this repo before
+  the first CdkDev):
   - `/email-mcp/google-client-id`
   - `/email-mcp/google-client-secret`
 
