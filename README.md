@@ -39,8 +39,10 @@ SSM Google OAuth secrets for this app are `./run.sh push-secrets-dev` /
 Copy [emailmcp/.env.example](emailmcp/.env.example) to `emailmcp/.env` for local
 HTTP mode (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`).
 For AWS, copy [`.env.example`](.env.example) to `.env.dev` / `.env.prod` and run
-`./run.sh push-secrets-dev` / `push-secrets-prod` (credentials for that env
-account, or `DEV_PROFILE` / `PROD_PROFILE`).
+`./run.sh push-secrets-dev` / `push-secrets-prod`. Those commands use AWS
+profiles `mcp-dev` / `mcp-prod` (MCPCICD `./run.sh child-profile`) unless you
+set `DEV_PROFILE` / `PROD_PROFILE`. Do not use default credentials — they
+target the wrong account.
 
 PRs run GitHub Actions only (`go test ./...` + `docker build`). Merges to
 `master` are released by the MCPCICD pipeline named `email-mcp`.

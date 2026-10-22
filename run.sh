@@ -92,12 +92,16 @@ ssm_parameter_name() {
 }
 
 put_secure_params() {
+  local region="${SSM_REGION:-}"
+  local extra=()
+  [[ -n "$region" ]] && extra+=(--region "$region")
   while [[ $# -ge 2 ]]; do
     aws ssm put-parameter \
       --name "$1" \
       --type SecureString \
       --value "$2" \
       --overwrite \
+      "${extra[@]}" \
       >/dev/null
     log "Pushed $1"
     shift 2
@@ -195,17 +199,17 @@ cmd_synth() {
 
 cmd_push_secrets() {
   local env_name="$1"
-  local profile env_file client_id client_secret id_name secret_name account
+  local profile env_file client_id client_secret id_name secret_name account region arn err profile_var
   require aws
   require node
 
   case "$env_name" in
     Dev)
-      profile="${DEV_PROFILE:-${AWS_PROFILE:-}}"
+      profile="${DEV_PROFILE:-mcp-dev}"
       env_file="${DEV_ENV_FILE:-${PROJECT_ROOT}/.env.dev}"
       ;;
     Prod)
-      profile="${PROD_PROFILE:-${AWS_PROFILE:-}}"
+      profile="${PROD_PROFILE:-mcp-prod}"
       env_file="${PROD_ENV_FILE:-${PROJECT_ROOT}/.env.prod}"
       ;;
     *)
@@ -223,10 +227,22 @@ cmd_push_secrets() {
 
   id_name="$(ssm_parameter_name googleClientId /email-mcp/google-client-id)"
   secret_name="$(ssm_parameter_name googleClientSecret /email-mcp/google-client-secret)"
-  account="$(with_profile "$profile" aws sts get-caller-identity --query Account --output text)"
-  log "Pushing SSM SecureString secrets to ${env_name} account ${account}"
+  region="$(aws configure get region --profile "$profile" 2>/dev/null || true)"
+  region="${region:-${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}}"
+  err="$(mktemp)"
+  if ! account="$(with_profile "$profile" aws sts get-caller-identity --query Account --output text 2>"$err")"; then
+    rm -f "$err"
+    profile_var=PROD_PROFILE
+    [[ "$env_name" == Dev ]] && profile_var=DEV_PROFILE
+    die "cannot use AWS profile '${profile}' for ${env_name}. Create mcp-dev/mcp-prod with MCPCICD ./run.sh child-profile, or set ${profile_var}. Default credentials write to the wrong account."
+  fi
+  rm -f "$err"
+  arn="$(with_profile "$profile" aws sts get-caller-identity --query Arn --output text)"
+  log "Pushing SSM SecureString secrets to ${env_name} via profile ${profile}"
+  log "  account ${account}  region ${region}"
+  log "  identity ${arn}"
   log "  Google OAuth from $(relpath "$env_file")"
-  with_profile "$profile" put_secure_params \
+  SSM_REGION="$region" with_profile "$profile" put_secure_params \
     "$id_name" "$client_id" \
     "$secret_name" "$client_secret"
   log "Done. EmailMcpStack can now read ${id_name} and ${secret_name}."
@@ -260,15 +276,15 @@ CDK (local check only):
   cdk-install      Install CDK Node dependencies (cdk/).
   synth            Synthesize the CloudFormation template.
 
-SSM secrets (this app, current AWS account):
+SSM secrets (MCPCICD Dev/Prod env accounts):
   push-secrets-dev Write /email-mcp/google-client-id and google-client-secret
-                   from .env.dev (emailmcp/.env is not used).
-  push-secrets-prod Same for Prod from .env.prod.
+                   from .env.dev using profile mcp-dev (emailmcp/.env is not used).
+  push-secrets-prod Same for Prod from .env.prod using profile mcp-prod.
 
 Environment overrides:
   IMAGE_NAME        Docker image tag for docker-build (default email-mcp:latest).
   ENV_FILE          Path to the laptop KEY=VALUE file (default: emailmcp/.env).
-  DEV_PROFILE / PROD_PROFILE   AWS CLI profile for push-secrets-* (else AWS_PROFILE).
+  DEV_PROFILE / PROD_PROFILE   AWS CLI profile for push-secrets-* (default mcp-dev / mcp-prod).
   DEV_ENV_FILE / PROD_ENV_FILE KEY=VALUE files (default: .env.dev / .env.prod).
 
 Configuration file:
