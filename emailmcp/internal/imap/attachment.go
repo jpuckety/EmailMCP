@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
@@ -72,29 +73,28 @@ func (m *Manager) GetAttachment(ctx context.Context, acc *types.Account, folder 
 		return nil, err
 	}
 
-	conn, err := m.Acquire(ctx, acc)
+	var msgs []*imapclient.FetchMessageBuffer
+	err = m.withConn(ctx, acc, func(conn *pooledConn) error {
+		_, err := conn.client.Select(folder, nil).Wait()
+		if err != nil {
+			return mapIMAPError(folder, fmt.Errorf("select %s: %w", folder, err))
+		}
+
+		opts := &imap.FetchOptions{
+			BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
+			BodySection: []*imap.FetchItemBodySection{
+				{Part: partNums, Peek: true},
+			},
+		}
+		var ferr error
+		msgs, ferr = conn.client.Fetch(imap.UIDSetNum(imap.UID(uid)), opts).Collect()
+		if ferr != nil {
+			return mapIMAPError(folder, fmt.Errorf("fetch attachment: %w", ferr))
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	hadErr := false
-	defer func() { m.Release(acc, conn, hadErr) }()
-
-	_, err = conn.client.Select(folder, nil).Wait()
-	if err != nil {
-		hadErr = true
-		return nil, mapIMAPError(folder, fmt.Errorf("select %s: %w", folder, err))
-	}
-
-	opts := &imap.FetchOptions{
-		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
-		BodySection: []*imap.FetchItemBodySection{
-			{Part: partNums, Peek: true},
-		},
-	}
-	msgs, err := conn.client.Fetch(imap.UIDSetNum(imap.UID(uid)), opts).Collect()
-	if err != nil {
-		hadErr = true
-		return nil, mapIMAPError(folder, fmt.Errorf("fetch attachment: %w", err))
 	}
 	if len(msgs) == 0 {
 		return nil, types.NewError(types.CodeMessageNotFound, "message not found", map[string]any{"uid": uid})

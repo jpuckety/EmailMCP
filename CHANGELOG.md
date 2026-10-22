@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 — 2026-10-22
+
+### Fixed
+- IMAP pool no longer holds the account lock during NOOP/dial/login, so one slow mailbox cannot 504 every other request.
+- Stale IMAP connections are health-checked with a timeout and operations retry once on EOF/reset.
+- `send_email` returns after SMTP success; Sent-folder APPEND runs in the background so Gmail/WorkMail sends are not gated on IMAP.
+- MCP Streamable HTTP uses JSON responses so concurrent tool calls on one session cannot receive each other's results.
+- SMTP I/O is bound to the request deadline so a timed-out send cannot keep running and invite duplicate retries.
+- ALB idle timeout raised to 120s to match the HTTP write timeout.
+
 ## 0.3.0 — 2026-10-21
 
 ### Added

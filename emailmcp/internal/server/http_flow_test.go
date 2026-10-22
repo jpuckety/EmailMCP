@@ -128,4 +128,7 @@ func TestAuthenticatedMCPFlow_PublicHost(t *testing.T) {
 	if !strings.Contains(body2, `"accounts"`) {
 		t.Fatalf("unexpected tools/call body: %s", body2)
 	}
+	if ct := resp2.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("expected JSON response, got Content-Type %q body %s", ct, body2)
+	}
 }

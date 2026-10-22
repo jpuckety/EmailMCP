@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -171,6 +172,9 @@ func (s *Server) HTTPHandler() http.Handler {
 		return s.mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Logger: s.logger,
+		// Return one JSON-RPC body per HTTP POST so concurrent tool calls on the
+		// same MCP session cannot have their SSE streams cross-wired.
+		JSONResponse: true,
 		// DNS-rebinding / "localhost" protection is auto-enabled by the SDK and
 		// rejects any request whose connection has a loopback *local* address but
 		// a non-loopback Host header with "403 Forbidden: invalid Host header".
@@ -830,12 +834,7 @@ func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in Sen
 	}
 
 	if smtp.ShouldSaveToSent(s.saveToSentMode(acc, in.SaveToSent), acc.SMTPHost) {
-		if app, appErr := s.imapMgr.AppendSent(ctx, acc, raw); appErr != nil {
-			s.logger.Info("save to sent failed", "account_id", acc.ID, "error", appErr)
-		} else if app != nil {
-			result.SavedToSent = true
-			result.SentFolder = app.Folder
-		}
+		s.enqueueSaveToSent(acc, raw)
 	}
 
 	text := fmt.Sprintf("Email sent. Message-ID: %s", result.MessageID)
@@ -843,6 +842,27 @@ func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in Sen
 		text += fmt.Sprintf(" (%d recipient(s) rejected)", len(result.Rejected))
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, result, nil
+}
+
+const saveToSentTimeout = 45 * time.Second
+
+func (s *Server) enqueueSaveToSent(acc *types.Account, raw []byte) {
+	if s == nil || s.imapMgr == nil || acc == nil || len(raw) == 0 {
+		return
+	}
+	accCopy := *acc
+	rawCopy := bytes.Clone(raw)
+	logger := s.logger
+	imapMgr := s.imapMgr
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), saveToSentTimeout)
+		defer cancel()
+		if _, err := imapMgr.AppendSent(ctx, &accCopy, rawCopy); err != nil {
+			logger.Info("save to sent failed", "account_id", accCopy.ID, "error", err)
+			return
+		}
+		logger.Info("save to sent complete", "account_id", accCopy.ID)
+	}()
 }
 
 func (s *Server) createDraft(ctx context.Context, req *mcp.CallToolRequest, in CreateDraftInput) (*mcp.CallToolResult, any, error) {

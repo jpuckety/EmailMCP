@@ -179,6 +179,10 @@ func (s *Sender) deliver(ctx context.Context, acc *types.Account, addr string, a
 	if err != nil {
 		return nil, nil, fmt.Errorf("smtp dial: %w", err)
 	}
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer stop()
 
 	client, err := smtp.NewClient(conn, acc.SMTPHost)
 	if err != nil {

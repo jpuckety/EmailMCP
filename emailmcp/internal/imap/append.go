@@ -31,36 +31,33 @@ func (m *Manager) AppendMessage(ctx context.Context, acc *types.Account, folder 
 	logger := m.cfg.Logger.With("op", "append_message", "account_id", acc.ID, "folder", folder, "size", len(raw))
 	start := time.Now()
 
-	conn, err := m.Acquire(ctx, acc)
+	var res *AppendResult
+	err := m.withConn(ctx, acc, func(conn *pooledConn) error {
+		cmd := conn.client.Append(folder, int64(len(raw)), &imap.AppendOptions{
+			Flags: flags,
+			Time:  time.Now(),
+		})
+		if _, err := io.Copy(cmd, bytes.NewReader(raw)); err != nil {
+			_ = cmd.Close()
+			return mapIMAPError(folder, fmt.Errorf("append write: %w", err))
+		}
+		if err := cmd.Close(); err != nil {
+			return mapIMAPError(folder, fmt.Errorf("append: %w", err))
+		}
+		data, err := cmd.Wait()
+		if err != nil {
+			return mapIMAPError(folder, fmt.Errorf("append: %w", err))
+		}
+
+		res = &AppendResult{Folder: folder}
+		if data != nil {
+			res.UID = uint32(data.UID)
+			res.UIDValidity = data.UIDValidity
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	hadErr := false
-	defer func() { m.Release(acc, conn, hadErr) }()
-
-	cmd := conn.client.Append(folder, int64(len(raw)), &imap.AppendOptions{
-		Flags: flags,
-		Time:  time.Now(),
-	})
-	if _, err := io.Copy(cmd, bytes.NewReader(raw)); err != nil {
-		hadErr = true
-		_ = cmd.Close()
-		return nil, mapIMAPError(folder, fmt.Errorf("append write: %w", err))
-	}
-	if err := cmd.Close(); err != nil {
-		hadErr = true
-		return nil, mapIMAPError(folder, fmt.Errorf("append: %w", err))
-	}
-	data, err := cmd.Wait()
-	if err != nil {
-		hadErr = true
-		return nil, mapIMAPError(folder, fmt.Errorf("append: %w", err))
-	}
-
-	res := &AppendResult{Folder: folder}
-	if data != nil {
-		res.UID = uint32(data.UID)
-		res.UIDValidity = data.UIDValidity
 	}
 	logger.InfoContext(ctx, "appended message", "uid", res.UID, "elapsed", time.Since(start))
 	return res, nil
@@ -84,4 +81,3 @@ func (m *Manager) AppendSent(ctx context.Context, acc *types.Account, raw []byte
 	}
 	return m.AppendMessage(ctx, acc, folder, raw, []imap.Flag{imap.FlagSeen})
 }
-

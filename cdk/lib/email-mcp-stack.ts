@@ -269,6 +269,7 @@ export class EmailMcpStack extends cdk.Stack {
       vpc,
       internetFacing: true,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+      idleTimeout: cdk.Duration.seconds(120),
     });
 
     const blueTargetGroup = new elbv2.ApplicationTargetGroup(this, 'BlueTargetGroup', {

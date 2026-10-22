@@ -6,12 +6,27 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/config"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
+
+func TestEnqueueSaveToSent_DoesNotBlockWithoutIMAP(t *testing.T) {
+	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	done := make(chan struct{})
+	go func() {
+		s.enqueueSaveToSent(&types.Account{ID: "work"}, []byte("From: a\r\n\r\nbody"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("enqueueSaveToSent blocked")
+	}
+}
 
 func TestGetAccount_RequiredAccountID(t *testing.T) {
 	s := &Server{

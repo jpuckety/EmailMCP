@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/mail"
 	"strings"
 	"sync"
@@ -19,8 +21,10 @@ import (
 )
 
 const (
-	defaultMaxConns = 4
-	defaultIdle     = 4 * time.Minute
+	defaultMaxConns    = 4
+	defaultIdle        = 4 * time.Minute
+	healthCheckTimeout = 8 * time.Second
+	imapRetryAttempts  = 2
 )
 
 // Config for the IMAP manager.
@@ -47,12 +51,16 @@ type accountPool struct {
 	imapCfg   imapAccountConfig // plaintext only for the life of the pool
 
 	mu       sync.Mutex
+	cond     *sync.Cond
 	idle     []*pooledConn
 	inUse    int
 	maxConns int
 	idleT    time.Duration
 	logger   *slog.Logger
 	closed   bool
+
+	// dial, if set, replaces dialAndLogin (tests).
+	dial func(context.Context) (*pooledConn, error)
 }
 
 // PoolKey returns the map key for a user's account pool.
@@ -108,20 +116,6 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 
 	key := PoolKey(acc.OwnerUserID, acc.ID)
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if p, ok := m.pools[key]; ok {
-		return p, nil
-	}
-
-	logger := m.cfg.Logger.With(
-		"op", "get_or_create_pool",
-		"owner_user_id", acc.OwnerUserID,
-		"account_id", acc.ID,
-	)
-	logger.Debug("creating new imap pool", "host", acc.IMAPHost, "port", acc.IMAPPort, "use_tls", acc.IMAPUseTLS)
-
 	if acc.IMAPPassword == "" {
 		return nil, errors.New("imap password is required")
 	}
@@ -133,6 +127,36 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 	if err := netutil.RequireTLSUnlessLocalhost(acc.IMAPHost, acc.IMAPUseTLS, "IMAP"); err != nil {
 		return nil, err
 	}
+
+	m.mu.Lock()
+	if p, ok := m.pools[key]; ok && p.sameIMAPConfig(acc) {
+		m.mu.Unlock()
+		return p, nil
+	}
+	var stale *accountPool
+	if p, ok := m.pools[key]; ok {
+		delete(m.pools, key)
+		stale = p
+	}
+	m.mu.Unlock()
+	if stale != nil {
+		m.cfg.Logger.Info("replacing imap pool after account config change",
+			"owner_user_id", acc.OwnerUserID, "account_id", acc.ID)
+		stale.closeAll()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p, ok := m.pools[key]; ok {
+		return p, nil
+	}
+
+	logger := m.cfg.Logger.With(
+		"op", "get_or_create_pool",
+		"owner_user_id", acc.OwnerUserID,
+		"account_id", acc.ID,
+	)
+	logger.Debug("creating new imap pool", "host", acc.IMAPHost, "port", acc.IMAPPort, "use_tls", acc.IMAPUseTLS)
 
 	p := &accountPool{
 		poolKey:   key,
@@ -151,10 +175,19 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 		logger:   m.cfg.Logger,
 		idle:     make([]*pooledConn, 0, m.cfg.MaxConnsPerAccount),
 	}
+	p.cond = sync.NewCond(&p.mu)
 
 	m.pools[key] = p
 	logger.Info("imap pool created", "max_conns", p.maxConns, "idle_timeout", p.idleT)
 	return p, nil
+}
+
+func (p *accountPool) sameIMAPConfig(acc *types.Account) bool {
+	return p.imapCfg.Host == acc.IMAPHost &&
+		p.imapCfg.Port == acc.IMAPPort &&
+		p.imapCfg.Username == acc.IMAPUsername &&
+		p.imapCfg.Password == acc.IMAPPassword &&
+		p.imapCfg.UseTLS == acc.IMAPUseTLS
 }
 
 // Acquire gets a connection from the pool for the given account.
@@ -232,55 +265,149 @@ func (m *Manager) CloseAll() {
 // --- accountPool implementation ---
 
 func (p *accountPool) acquire(ctx context.Context) (*pooledConn, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	logger := p.logger.With("op", "pool_acquire", "account_id", p.accountID)
 
-	if p.closed {
-		logger.WarnContext(ctx, "acquire on closed pool")
-		return nil, errors.New("pool closed")
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			logger.WarnContext(ctx, "acquire on closed pool")
+			return nil, errors.New("pool closed")
+		}
+
+		if c := p.popIdleLocked(); c != nil {
+			p.inUse++
+			p.mu.Unlock()
+			if err := p.healthCheck(ctx, c); err != nil {
+				logger.WarnContext(ctx, "idle connection failed health check; discarding", "error", err)
+				if c.client != nil {
+					c.client.Close()
+				}
+				p.mu.Lock()
+				p.inUse--
+				p.cond.Signal()
+				p.mu.Unlock()
+				continue
+			}
+			c.lastUsed = time.Now()
+			logger.DebugContext(ctx, "reusing idle connection", "in_use", p.inUse)
+			return c, nil
+		}
+
+		if p.inUse < p.maxConns {
+			p.inUse++
+			p.mu.Unlock()
+			conn, err := p.newConn(ctx)
+			if err != nil {
+				p.mu.Lock()
+				p.inUse--
+				p.cond.Signal()
+				p.mu.Unlock()
+				return nil, err
+			}
+			logger.DebugContext(ctx, "new connection created", "in_use", p.inUse)
+			return conn, nil
+		}
+
+		logger.DebugContext(ctx, "waiting for imap connection slot",
+			"in_use", p.inUse, "max_conns", p.maxConns)
+		if err := p.waitForSlot(ctx); err != nil {
+			p.mu.Unlock()
+			return nil, err
+		}
+		p.mu.Unlock()
 	}
+}
 
-	logger.DebugContext(ctx, "acquiring connection",
-		"idle", len(p.idle), "in_use", p.inUse, "max_conns", p.maxConns)
-
-	// Try idle first
-	for i := len(p.idle) - 1; i >= 0; i-- {
+func (p *accountPool) popIdleLocked() *pooledConn {
+	for len(p.idle) > 0 {
+		i := len(p.idle) - 1
 		c := p.idle[i]
 		p.idle = p.idle[:i]
+		if c == nil {
+			continue
+		}
 		if time.Since(c.lastUsed) > p.idleT {
-			logger.DebugContext(ctx, "discarding idle connection past idle timeout",
-				"idle_for", time.Since(c.lastUsed))
-			c.client.Close()
+			client := c.client
+			go func() {
+				if client != nil {
+					client.Close()
+				}
+			}()
 			continue
 		}
-		// Quick health check
-		if err := c.client.Noop().Wait(); err != nil {
-			logger.WarnContext(ctx, "idle connection failed NOOP; discarding", "error", err)
-			c.client.Close()
-			continue
+		return c
+	}
+	return nil
+}
+
+func (p *accountPool) newConn(ctx context.Context) (*pooledConn, error) {
+	type result struct {
+		c   *pooledConn
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		if p.dial != nil {
+			c, err := p.dial(ctx)
+			done <- result{c, err}
+			return
 		}
-		p.inUse++
-		c.lastUsed = time.Now()
-		logger.DebugContext(ctx, "reusing idle connection", "in_use", p.inUse)
-		return c, nil
+		c, err := p.dialAndLogin(ctx)
+		done <- result{c, err}
+	}()
+	select {
+	case <-ctx.Done():
+		go func() {
+			r := <-done
+			if r.c != nil && r.c.client != nil {
+				r.c.client.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	case r := <-done:
+		return r.c, r.err
 	}
+}
 
-	// Create new if capacity allows
-	if p.inUse >= p.maxConns {
-		logger.WarnContext(ctx, "connection limit reached",
-			"in_use", p.inUse, "max_conns", p.maxConns)
-		return nil, errors.New("imap connection limit reached for account")
+func (p *accountPool) healthCheck(ctx context.Context, c *pooledConn) error {
+	if c == nil || c.client == nil {
+		return errors.New("nil imap client")
 	}
+	ctx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- c.client.Noop().Wait()
+	}()
+	select {
+	case <-ctx.Done():
+		c.client.Close()
+		return fmt.Errorf("imap health check: %w", ctx.Err())
+	case err := <-done:
+		return err
+	}
+}
 
-	conn, err := p.dialAndLogin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	p.inUse++
-	logger.DebugContext(ctx, "new connection created", "in_use", p.inUse)
-	return conn, nil
+// waitForSlot waits until a connection may be available. p.mu must be held.
+func (p *accountPool) waitForSlot(ctx context.Context) error {
+	waitDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			p.mu.Lock()
+			p.cond.Broadcast()
+			p.mu.Unlock()
+		case <-waitDone:
+		}
+	}()
+	p.cond.Wait()
+	close(waitDone)
+	return ctx.Err()
 }
 
 func (p *accountPool) dialAndLogin(ctx context.Context) (*pooledConn, error) {
@@ -344,6 +471,12 @@ func (p *accountPool) release(conn *pooledConn, hadError bool) {
 	logger := p.logger.With("op", "pool_release", "account_id", p.accountID)
 
 	p.inUse--
+	if p.inUse < 0 {
+		p.inUse = 0
+	}
+	if p.cond != nil {
+		p.cond.Signal()
+	}
 
 	if hadError || p.closed || conn.client == nil {
 		if conn.client != nil {
@@ -354,18 +487,18 @@ func (p *accountPool) release(conn *pooledConn, hadError bool) {
 		return
 	}
 
-	// Return to idle
 	conn.lastUsed = time.Now()
 	p.idle = append(p.idle, conn)
 	logger.Debug("connection returned to idle pool",
 		"idle", len(p.idle), "in_use", p.inUse)
 
-	// Trim excess idle connections (keep at most maxConns)
 	for len(p.idle) > p.maxConns {
 		c := p.idle[0]
 		p.idle = p.idle[1:]
 		logger.Debug("trimming excess idle connection", "idle", len(p.idle))
-		c.client.Close()
+		if c.client != nil {
+			c.client.Close()
+		}
 	}
 }
 
@@ -373,6 +506,9 @@ func (p *accountPool) closeAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
+	if p.cond != nil {
+		p.cond.Broadcast()
+	}
 
 	logger := p.logger.With("op", "pool_close_all", "account_id", p.accountID)
 	logger.Info("closing account pool", "idle", len(p.idle), "in_use", p.inUse)
@@ -388,6 +524,51 @@ func (p *accountPool) closeAll() {
 	p.idle = nil
 }
 
+// withConn runs fn with an exclusive pooled connection and retries once if the
+// connection dies mid-command (EOF, reset, closed).
+func (m *Manager) withConn(ctx context.Context, acc *types.Account, fn func(*pooledConn) error) error {
+	var last error
+	for i := 1; i <= imapRetryAttempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		conn, err := m.Acquire(ctx, acc)
+		if err != nil {
+			return err
+		}
+		err = fn(conn)
+		m.Release(acc, conn, err != nil)
+		if err == nil || !isTransientIMAP(err) || i == imapRetryAttempts {
+			return err
+		}
+		last = err
+		m.cfg.Logger.WarnContext(ctx, "imap connection lost; retrying with a new connection",
+			"account_id", acc.ID, "attempt", i, "error", err)
+	}
+	return last
+}
+
+func isTransientIMAP(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "eof") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "use of closed") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "connection lost") ||
+		strings.Contains(s, "connection refused")
+}
+
 // --- High level operations ---
 
 // ListFolders lists available mailboxes for the account.
@@ -397,40 +578,33 @@ func (m *Manager) ListFolders(ctx context.Context, acc *types.Account) ([]types.
 
 	start := time.Now()
 
-	conn, err := m.Acquire(ctx, acc)
+	var folders []types.Folder
+	err := m.withConn(ctx, acc, func(conn *pooledConn) error {
+		logger.DebugContext(ctx, "issuing LIST command", "reference", "", "pattern", "%")
+		cmd := conn.client.List("", "%", nil)
+		mailboxes, err := cmd.Collect()
+		if err != nil {
+			logger.ErrorContext(ctx, "LIST command failed",
+				"error", err,
+				"elapsed", time.Since(start))
+			return fmt.Errorf("list mailboxes: %w", err)
+		}
+
+		folders = make([]types.Folder, 0, len(mailboxes))
+		for _, mb := range mailboxes {
+			f := types.Folder{
+				Name:      mb.Mailbox,
+				Delimiter: string(mb.Delim),
+			}
+			for _, attr := range mb.Attrs {
+				f.Attributes = append(f.Attributes, string(attr))
+			}
+			folders = append(folders, f)
+		}
+		return nil
+	})
 	if err != nil {
-		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
 		return nil, err
-	}
-	released := false
-	defer func() {
-		if !released {
-			m.Release(acc, conn, false)
-		}
-	}()
-
-	logger.DebugContext(ctx, "issuing LIST command", "reference", "", "pattern", "%")
-	cmd := conn.client.List("", "%", nil)
-	mailboxes, err := cmd.Collect()
-	if err != nil {
-		logger.ErrorContext(ctx, "LIST command failed",
-			"error", err,
-			"elapsed", time.Since(start))
-		m.Release(acc, conn, true)
-		released = true
-		return nil, fmt.Errorf("list mailboxes: %w", err)
-	}
-
-	folders := make([]types.Folder, 0, len(mailboxes))
-	for _, mb := range mailboxes {
-		f := types.Folder{
-			Name:      mb.Mailbox,
-			Delimiter: string(mb.Delim),
-		}
-		for _, attr := range mb.Attrs {
-			f.Attributes = append(f.Attributes, string(attr))
-		}
-		folders = append(folders, f)
 	}
 
 	logger.InfoContext(ctx, "listed folders",
@@ -461,81 +635,70 @@ func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder s
 	logger.DebugContext(ctx, "searching emails")
 	start := time.Now()
 
-	conn, err := m.Acquire(ctx, acc)
-	if err != nil {
-		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
-		return nil, err
-	}
-	hadErr := false
-	defer func() {
-		m.Release(acc, conn, hadErr)
-	}()
-
-	// Select folder (we track to reduce churn but still select each time for safety)
-	_, err = conn.client.Select(folder, nil).Wait()
-	if err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
-		return nil, fmt.Errorf("select folder %s: %w", folder, err)
-	}
-	conn.lastSelected = folder
-
-	uidList, totalMatches, usedServerSort, err := searchSortedUIDs(conn.client, &criteria, sortKey, reverse)
-	if err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "search/sort failed", "error", err, "elapsed", time.Since(start))
-		return nil, err
-	}
-	if len(uidList) == 0 {
-		logger.InfoContext(ctx, "search returned no results", "elapsed", time.Since(start))
-		return []types.EmailSummary{}, nil
-	}
-
-	// Server SORT (or arrival UID heuristic) can limit before FETCH.
-	// Other client-side sorts need envelopes for all matches first.
-	limitBeforeFetch := usedServerSort || sortKey == SortKeyArrival
-	if limitBeforeFetch && limit > 0 && len(uidList) > limit {
-		uidList = uidList[:limit]
-	}
-	logger.DebugContext(ctx, "fetching summaries",
-		"total_matches", totalMatches,
-		"fetching", len(uidList),
-		"server_sort", usedServerSort,
-	)
-
-	// Fetch summaries (Envelope + Flags + RFC822.SIZE)
-	fetchOpts := &imap.FetchOptions{
-		Envelope:      true,
-		Flags:         true,
-		BodyStructure: &imap.FetchItemBodyStructure{},
-		BodySection: []*imap.FetchItemBodySection{
-			{Specifier: imap.PartSpecifierHeader},
-		},
-		RFC822Size: true,
-	}
-
-	fetchCmd := conn.client.Fetch(imap.UIDSetNum(uidList...), fetchOpts)
-
-	msgs, err := fetchCmd.Collect()
-	if err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "FETCH summaries failed", "error", err, "elapsed", time.Since(start))
-		return nil, fmt.Errorf("fetch summaries: %w", err)
-	}
-
-	summaries := make([]types.EmailSummary, 0, len(msgs))
-	for _, msg := range msgs {
-		summaries = append(summaries, summaryFromBuffer(msg))
-	}
-
-	if !limitBeforeFetch {
-		sortSummaries(summaries, sortKey, reverse)
-		if limit > 0 && len(summaries) > limit {
-			summaries = summaries[:limit]
+	var summaries []types.EmailSummary
+	var totalMatches int
+	err := m.withConn(ctx, acc, func(conn *pooledConn) error {
+		_, err := conn.client.Select(folder, nil).Wait()
+		if err != nil {
+			logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
+			return fmt.Errorf("select folder %s: %w", folder, err)
 		}
-	} else {
-		// FETCH does not guarantee response order — re-apply search/sort order.
-		summaries = orderSummariesByUIDs(summaries, uidList)
+		conn.lastSelected = folder
+
+		uidList, total, usedServerSort, err := searchSortedUIDs(conn.client, &criteria, sortKey, reverse)
+		if err != nil {
+			logger.ErrorContext(ctx, "search/sort failed", "error", err, "elapsed", time.Since(start))
+			return err
+		}
+		totalMatches = total
+		if len(uidList) == 0 {
+			summaries = []types.EmailSummary{}
+			return nil
+		}
+
+		limitBeforeFetch := usedServerSort || sortKey == SortKeyArrival
+		if limitBeforeFetch && limit > 0 && len(uidList) > limit {
+			uidList = uidList[:limit]
+		}
+		logger.DebugContext(ctx, "fetching summaries",
+			"total_matches", totalMatches,
+			"fetching", len(uidList),
+			"server_sort", usedServerSort,
+		)
+
+		fetchOpts := &imap.FetchOptions{
+			Envelope:      true,
+			Flags:         true,
+			BodyStructure: &imap.FetchItemBodyStructure{},
+			BodySection: []*imap.FetchItemBodySection{
+				{Specifier: imap.PartSpecifierHeader},
+			},
+			RFC822Size: true,
+		}
+
+		msgs, err := conn.client.Fetch(imap.UIDSetNum(uidList...), fetchOpts).Collect()
+		if err != nil {
+			logger.ErrorContext(ctx, "FETCH summaries failed", "error", err, "elapsed", time.Since(start))
+			return fmt.Errorf("fetch summaries: %w", err)
+		}
+
+		summaries = make([]types.EmailSummary, 0, len(msgs))
+		for _, msg := range msgs {
+			summaries = append(summaries, summaryFromBuffer(msg))
+		}
+
+		if !limitBeforeFetch {
+			sortSummaries(summaries, sortKey, reverse)
+			if limit > 0 && len(summaries) > limit {
+				summaries = summaries[:limit]
+			}
+		} else {
+			summaries = orderSummariesByUIDs(summaries, uidList)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	logger.InfoContext(ctx, "search complete",
@@ -594,94 +757,87 @@ func (m *Manager) GetEmail(ctx context.Context, acc *types.Account, folder strin
 	logger.DebugContext(ctx, "fetching email")
 	start := time.Now()
 
-	conn, err := m.Acquire(ctx, acc)
+	var em *types.EmailMessage
+	err := m.withConn(ctx, acc, func(conn *pooledConn) error {
+		_, err := conn.client.Select(folder, nil).Wait()
+		if err != nil {
+			logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
+			return mapIMAPError(folder, fmt.Errorf("select %s: %w", folder, err))
+		}
+		conn.lastSelected = folder
+
+		opts := &imap.FetchOptions{
+			Envelope:      true,
+			Flags:         true,
+			BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
+			BodySection: []*imap.FetchItemBodySection{
+				{Specifier: imap.PartSpecifierHeader, Peek: true},
+				{Specifier: imap.PartSpecifierText, Peek: true},
+			},
+			RFC822Size: true,
+		}
+
+		msgs, err := conn.client.Fetch(imap.UIDSetNum(imap.UID(uid)), opts).Collect()
+		if err != nil {
+			logger.ErrorContext(ctx, "FETCH failed", "error", err, "elapsed", time.Since(start))
+			return fmt.Errorf("fetch message: %w", err)
+		}
+		if len(msgs) == 0 {
+			logger.WarnContext(ctx, "message not found", "elapsed", time.Since(start))
+			return errors.New("message not found")
+		}
+		msg := msgs[0]
+
+		em = &types.EmailMessage{
+			EmailSummary: types.EmailSummary{
+				UID:   uint32(msg.UID),
+				Flags: flagStrings(msg.Flags),
+				Size:  uint32(msg.RFC822Size),
+			},
+			Folder: folder,
+		}
+
+		em.Headers = map[string]string{}
+		if msg.Envelope != nil {
+			em.Subject = msg.Envelope.Subject
+			em.From = convertAddresses(msg.Envelope.From)
+			em.To = convertAddresses(msg.Envelope.To)
+			em.Cc = convertAddresses(msg.Envelope.Cc)
+			em.Date = msg.Envelope.Date
+			if msg.Envelope.MessageID != "" {
+				em.Headers["Message-ID"] = msg.Envelope.MessageID
+			}
+			if len(msg.Envelope.InReplyTo) > 0 {
+				em.Headers["In-Reply-To"] = strings.Join(msg.Envelope.InReplyTo, " ")
+			}
+		}
+
+		for _, bs := range msg.BodySection {
+			if len(bs.Bytes) == 0 {
+				continue
+			}
+			if bs.Section != nil && bs.Section.Specifier == imap.PartSpecifierHeader {
+				parseMessageHeaders(em, bs.Bytes)
+				continue
+			}
+			content := string(bs.Bytes)
+			if em.HTML == "" && looksLikeHTML(content) {
+				em.HTML = content
+			} else if em.Text == "" {
+				em.Text = content
+			}
+		}
+
+		if msg.BodyStructure != nil {
+			em.Attachments = extractAttachments(msg.BodyStructure)
+			if hasAttachmentStructure(msg.BodyStructure) {
+				em.HasAttach = true
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
 		return nil, err
-	}
-	hadErr := false
-	defer func() {
-		m.Release(acc, conn, hadErr)
-	}()
-
-	_, err = conn.client.Select(folder, nil).Wait()
-	if err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
-		return nil, mapIMAPError(folder, fmt.Errorf("select %s: %w", folder, err))
-	}
-	conn.lastSelected = folder
-
-	// Fetch full body + envelope + structure + headers (Message-ID, References).
-	opts := &imap.FetchOptions{
-		Envelope:      true,
-		Flags:         true,
-		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
-		BodySection: []*imap.FetchItemBodySection{
-			{Specifier: imap.PartSpecifierHeader, Peek: true},
-			{Specifier: imap.PartSpecifierText, Peek: true},
-		},
-		RFC822Size: true,
-	}
-
-	msgs, err := conn.client.Fetch(imap.UIDSetNum(imap.UID(uid)), opts).Collect()
-	if err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "FETCH failed", "error", err, "elapsed", time.Since(start))
-		return nil, fmt.Errorf("fetch message: %w", err)
-	}
-	if len(msgs) == 0 {
-		logger.WarnContext(ctx, "message not found", "elapsed", time.Since(start))
-		return nil, errors.New("message not found")
-	}
-	msg := msgs[0]
-
-	em := &types.EmailMessage{
-		EmailSummary: types.EmailSummary{
-			UID:   uint32(msg.UID),
-			Flags: flagStrings(msg.Flags),
-			Size:  uint32(msg.RFC822Size),
-		},
-		Folder: folder,
-	}
-
-	em.Headers = map[string]string{}
-	if msg.Envelope != nil {
-		em.Subject = msg.Envelope.Subject
-		em.From = convertAddresses(msg.Envelope.From)
-		em.To = convertAddresses(msg.Envelope.To)
-		em.Cc = convertAddresses(msg.Envelope.Cc)
-		em.Date = msg.Envelope.Date
-		if msg.Envelope.MessageID != "" {
-			em.Headers["Message-ID"] = msg.Envelope.MessageID
-		}
-		if len(msg.Envelope.InReplyTo) > 0 {
-			em.Headers["In-Reply-To"] = strings.Join(msg.Envelope.InReplyTo, " ")
-		}
-	}
-
-	for _, bs := range msg.BodySection {
-		if len(bs.Bytes) == 0 {
-			continue
-		}
-		if bs.Section != nil && bs.Section.Specifier == imap.PartSpecifierHeader {
-			parseMessageHeaders(em, bs.Bytes)
-			continue
-		}
-		content := string(bs.Bytes)
-		if em.HTML == "" && looksLikeHTML(content) {
-			em.HTML = content
-		} else if em.Text == "" {
-			em.Text = content
-		}
-	}
-
-	// Extract attachments info from body structure (best effort)
-	if msg.BodyStructure != nil {
-		em.Attachments = extractAttachments(msg.BodyStructure)
-		if hasAttachmentStructure(msg.BodyStructure) {
-			em.HasAttach = true
-		}
 	}
 
 	logger.InfoContext(ctx, "fetched email",
@@ -704,27 +860,23 @@ func (m *Manager) MoveEmails(ctx context.Context, acc *types.Account, folder str
 	logger.DebugContext(ctx, "moving emails")
 	start := time.Now()
 
-	conn, err := m.Acquire(ctx, acc)
+	err := m.withConn(ctx, acc, func(conn *pooledConn) error {
+		_, err := conn.client.Select(folder, nil).Wait()
+		if err != nil {
+			logger.ErrorContext(ctx, "SELECT source failed", "error", err, "elapsed", time.Since(start))
+			return fmt.Errorf("select source: %w", err)
+		}
+
+		uidSet := imap.UIDSetNum(uidsToUIDs(uids)...)
+		_, err = conn.client.Move(uidSet, destFolder).Wait()
+		if err != nil {
+			logger.ErrorContext(ctx, "MOVE failed", "error", err, "elapsed", time.Since(start))
+			return fmt.Errorf("move: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
 		return err
-	}
-	hadErr := false
-	defer func() { m.Release(acc, conn, hadErr) }()
-
-	_, err = conn.client.Select(folder, nil).Wait()
-	if err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "SELECT source failed", "error", err, "elapsed", time.Since(start))
-		return fmt.Errorf("select source: %w", err)
-	}
-
-	uidSet := imap.UIDSetNum(uidsToUIDs(uids)...)
-	_, err = conn.client.Move(uidSet, destFolder).Wait()
-	if err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "MOVE failed", "error", err, "elapsed", time.Since(start))
-		return fmt.Errorf("move: %w", err)
 	}
 
 	logger.InfoContext(ctx, "moved emails", "elapsed", time.Since(start))
@@ -745,41 +897,37 @@ func (m *Manager) FlagEmails(ctx context.Context, acc *types.Account, folder str
 	logger.DebugContext(ctx, "updating flags")
 	start := time.Now()
 
-	conn, err := m.Acquire(ctx, acc)
+	err := m.withConn(ctx, acc, func(conn *pooledConn) error {
+		_, err := conn.client.Select(folder, nil).Wait()
+		if err != nil {
+			logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
+			return fmt.Errorf("select: %w", err)
+		}
+
+		imapFlags := make([]imap.Flag, len(flags))
+		for i, f := range flags {
+			imapFlags[i] = imap.Flag(f)
+		}
+
+		storeOp := imap.StoreFlagsAdd
+		if !add {
+			storeOp = imap.StoreFlagsDel
+		}
+
+		uidSet := imap.UIDSetNum(uidsToUIDs(uids)...)
+		storeCmd := conn.client.Store(uidSet, &imap.StoreFlags{
+			Op:     storeOp,
+			Silent: true,
+			Flags:  imapFlags,
+		}, nil)
+		if err := storeCmd.Close(); err != nil {
+			logger.ErrorContext(ctx, "STORE flags failed", "error", err, "elapsed", time.Since(start))
+			return fmt.Errorf("store flags: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
 		return err
-	}
-	hadErr := false
-	defer func() { m.Release(acc, conn, hadErr) }()
-
-	_, err = conn.client.Select(folder, nil).Wait()
-	if err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
-		return fmt.Errorf("select: %w", err)
-	}
-
-	imapFlags := make([]imap.Flag, len(flags))
-	for i, f := range flags {
-		imapFlags[i] = imap.Flag(f)
-	}
-
-	storeOp := imap.StoreFlagsAdd
-	if !add {
-		storeOp = imap.StoreFlagsDel
-	}
-
-	uidSet := imap.UIDSetNum(uidsToUIDs(uids)...)
-	storeCmd := conn.client.Store(uidSet, &imap.StoreFlags{
-		Op:     storeOp,
-		Silent: true,
-		Flags:  imapFlags,
-	}, nil)
-	if err := storeCmd.Close(); err != nil {
-		hadErr = true
-		logger.ErrorContext(ctx, "STORE flags failed", "error", err, "elapsed", time.Since(start))
-		return fmt.Errorf("store flags: %w", err)
 	}
 
 	logger.InfoContext(ctx, "flags updated", "elapsed", time.Since(start))

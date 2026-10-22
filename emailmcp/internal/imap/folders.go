@@ -19,16 +19,13 @@ var (
 // FindSpecialUseFolder locates a mailbox by SPECIAL-USE attribute, then by common names.
 func (m *Manager) FindSpecialUseFolder(ctx context.Context, acc *types.Account, attr imap.MailboxAttr, fallbacks []string) (string, error) {
 	logger := m.cfg.Logger.With("op", "find_special_use", "account_id", acc.ID, "attr", string(attr))
-	conn, err := m.Acquire(ctx, acc)
+	var name string
+	err := m.withConn(ctx, acc, func(conn *pooledConn) error {
+		var err error
+		name, err = findSpecialUseFolder(conn.client, attr, fallbacks)
+		return err
+	})
 	if err != nil {
-		return "", err
-	}
-	hadErr := false
-	defer func() { m.Release(acc, conn, hadErr) }()
-
-	name, err := findSpecialUseFolder(conn.client, attr, fallbacks)
-	if err != nil {
-		hadErr = true
 		return "", err
 	}
 	logger.InfoContext(ctx, "found special-use folder", "folder", name)
