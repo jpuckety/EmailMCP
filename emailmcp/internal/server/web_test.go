@@ -605,6 +605,212 @@ func TestAPIAccounts_VerifyUsesSavedAccount(t *testing.T) {
 	}
 }
 
+func TestAPIAccounts_VerifyLogsFailures(t *testing.T) {
+	srv, token := newTestWebServerWithSession(t)
+	var logBuf bytes.Buffer
+	srv.logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	saved := &types.Account{
+		ID:           "log-mail",
+		OwnerUserID:  "user123",
+		Name:         "Log Mail",
+		IMAPHost:     "127.0.0.1",
+		IMAPPort:     993,
+		IMAPUsername: "user@local",
+		IMAPPassword: "stored-secret",
+		IMAPUseTLS:   true,
+		SMTPHost:     "10.0.0.1",
+		SMTPPort:     587,
+		SMTPUsername: "user@local",
+		SMTPPassword: "stored-secret",
+		SMTPUseTLS:   true,
+	}
+	if err := srv.configStore.PutUserConfig(context.Background(), "user123", saved); err != nil {
+		t.Fatalf("PutUserConfig: %v", err)
+	}
+
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts/log-mail/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST verify: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "account verification started") {
+		t.Fatalf("expected start log, got: %s", logs)
+	}
+	if !strings.Contains(logs, "account verification failed") {
+		t.Fatalf("expected failure log, got: %s", logs)
+	}
+	if !strings.Contains(logs, "smtp_error") || !strings.Contains(logs, "imap_error") {
+		t.Fatalf("expected component errors in log, got: %s", logs)
+	}
+	if strings.Contains(logs, "stored-secret") {
+		t.Fatalf("verification log leaked password: %s", logs)
+	}
+}
+
+func TestAPIAccounts_UpdateIMAPPasswordSyncsBlankSMTP(t *testing.T) {
+	srv, token := newTestWebServerWithSession(t)
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	client := http.DefaultClient
+	useTLS := true
+	createPayload := AccountPayload{
+		ID:           "shared-pass",
+		Name:         "Shared Pass",
+		IMAPHost:     "imap.fastmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "worker@fastmail.com",
+		IMAPPassword: "old-imap-password",
+		IMAPUseTLS:   &useTLS,
+		SMTPHost:     "smtp.fastmail.com",
+		SMTPPort:     587,
+		SMTPUseTLS:   &useTLS,
+	}
+	createJSON, _ := json.Marshal(createPayload)
+	reqCreate, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts", bytes.NewReader(createJSON))
+	reqCreate.Header.Set("Authorization", "Bearer "+token)
+	reqCreate.Header.Set("Content-Type", "application/json")
+	respCreate, err := client.Do(reqCreate)
+	if err != nil {
+		t.Fatalf("POST /api/accounts: %v", err)
+	}
+	defer respCreate.Body.Close()
+	if respCreate.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(respCreate.Body)
+		t.Fatalf("create status = %d, body = %s", respCreate.StatusCode, b)
+	}
+
+	stored, err := srv.configStore.GetUserConfig(context.Background(), "user123", "shared-pass")
+	if err != nil {
+		t.Fatalf("GetUserConfig after create: %v", err)
+	}
+	if stored.SMTPPassword != "old-imap-password" {
+		t.Fatalf("expected SMTP password to copy IMAP on create, got %q", stored.SMTPPassword)
+	}
+
+	updatePayload := AccountPayload{
+		Name:         "Shared Pass",
+		IMAPHost:     "imap.fastmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "worker@fastmail.com",
+		IMAPPassword: "new-imap-password",
+		IMAPUseTLS:   &useTLS,
+		SMTPHost:     "smtp.fastmail.com",
+		SMTPPort:     587,
+		SMTPUseTLS:   &useTLS,
+	}
+	updateJSON, _ := json.Marshal(updatePayload)
+	reqUpdate, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/accounts/shared-pass", bytes.NewReader(updateJSON))
+	reqUpdate.Header.Set("Authorization", "Bearer "+token)
+	reqUpdate.Header.Set("Content-Type", "application/json")
+	respUpdate, err := client.Do(reqUpdate)
+	if err != nil {
+		t.Fatalf("PUT /api/accounts/shared-pass: %v", err)
+	}
+	defer respUpdate.Body.Close()
+	if respUpdate.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(respUpdate.Body)
+		t.Fatalf("update status = %d, body = %s", respUpdate.StatusCode, b)
+	}
+
+	stored, err = srv.configStore.GetUserConfig(context.Background(), "user123", "shared-pass")
+	if err != nil {
+		t.Fatalf("GetUserConfig after update: %v", err)
+	}
+	if stored.IMAPPassword != "new-imap-password" {
+		t.Fatalf("IMAP password = %q, want new-imap-password", stored.IMAPPassword)
+	}
+	if stored.SMTPPassword != "new-imap-password" {
+		t.Fatalf("SMTP password = %q, want new-imap-password (blank SMTP should follow IMAP)", stored.SMTPPassword)
+	}
+}
+
+func TestAPIAccounts_UpdatePreservesDistinctSMTPPassword(t *testing.T) {
+	srv, token := newTestWebServerWithSession(t)
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+
+	client := http.DefaultClient
+	useTLS := true
+	createPayload := AccountPayload{
+		ID:           "split-pass",
+		Name:         "Split Pass",
+		IMAPHost:     "imap.fastmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "worker@fastmail.com",
+		IMAPPassword: "imap-secret",
+		IMAPUseTLS:   &useTLS,
+		SMTPHost:     "smtp.fastmail.com",
+		SMTPPort:     587,
+		SMTPUsername: "smtp-user@fastmail.com",
+		SMTPPassword: "smtp-secret",
+		SMTPUseTLS:   &useTLS,
+	}
+	createJSON, _ := json.Marshal(createPayload)
+	reqCreate, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts", bytes.NewReader(createJSON))
+	reqCreate.Header.Set("Authorization", "Bearer "+token)
+	reqCreate.Header.Set("Content-Type", "application/json")
+	respCreate, err := client.Do(reqCreate)
+	if err != nil {
+		t.Fatalf("POST /api/accounts: %v", err)
+	}
+	defer respCreate.Body.Close()
+	if respCreate.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(respCreate.Body)
+		t.Fatalf("create status = %d, body = %s", respCreate.StatusCode, b)
+	}
+
+	updatePayload := AccountPayload{
+		Name:         "Split Pass",
+		IMAPHost:     "imap.fastmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "worker@fastmail.com",
+		IMAPPassword: "new-imap-secret",
+		IMAPUseTLS:   &useTLS,
+		SMTPHost:     "smtp.fastmail.com",
+		SMTPPort:     587,
+		SMTPUseTLS:   &useTLS,
+	}
+	updateJSON, _ := json.Marshal(updatePayload)
+	reqUpdate, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/accounts/split-pass", bytes.NewReader(updateJSON))
+	reqUpdate.Header.Set("Authorization", "Bearer "+token)
+	reqUpdate.Header.Set("Content-Type", "application/json")
+	respUpdate, err := client.Do(reqUpdate)
+	if err != nil {
+		t.Fatalf("PUT /api/accounts/split-pass: %v", err)
+	}
+	defer respUpdate.Body.Close()
+	if respUpdate.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(respUpdate.Body)
+		t.Fatalf("update status = %d, body = %s", respUpdate.StatusCode, b)
+	}
+
+	stored, err := srv.configStore.GetUserConfig(context.Background(), "user123", "split-pass")
+	if err != nil {
+		t.Fatalf("GetUserConfig: %v", err)
+	}
+	if stored.IMAPPassword != "new-imap-secret" {
+		t.Fatalf("IMAP password = %q", stored.IMAPPassword)
+	}
+	if stored.SMTPPassword != "smtp-secret" {
+		t.Fatalf("distinct SMTP password was overwritten: got %q", stored.SMTPPassword)
+	}
+	if stored.SMTPUsername != "smtp-user@fastmail.com" {
+		t.Fatalf("distinct SMTP username was overwritten: got %q", stored.SMTPUsername)
+	}
+}
+
 func TestAPIAccounts_WebhookSettings(t *testing.T) {
 	srv, token := newTestWebServerWithSession(t)
 	ts := httptest.NewServer(srv.HTTPHandler())

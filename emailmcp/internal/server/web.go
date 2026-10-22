@@ -466,6 +466,11 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	oldIMAPUsername := existing.IMAPUsername
+	oldIMAPPassword := existing.IMAPPassword
+	oldSMTPUsername := existing.SMTPUsername
+	oldSMTPPassword := existing.SMTPPassword
+
 	if payload.Name != "" {
 		existing.Name = payload.Name
 	}
@@ -493,9 +498,15 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if payload.SMTPUsername != "" {
 		existing.SMTPUsername = payload.SMTPUsername
+	} else if payload.IMAPUsername != "" && (oldSMTPUsername == "" || oldSMTPUsername == oldIMAPUsername) {
+		// UI: "Leave blank to use IMAP username"
+		existing.SMTPUsername = payload.IMAPUsername
 	}
 	if payload.SMTPPassword != "" {
 		existing.SMTPPassword = payload.SMTPPassword
+	} else if payload.IMAPPassword != "" && (oldSMTPPassword == "" || oldSMTPPassword == oldIMAPPassword) {
+		// UI: "Leave blank to use IMAP password"
+		existing.SMTPPassword = payload.IMAPPassword
 	}
 	if payload.SMTPUseTLS != nil {
 		existing.SMTPUseTLS = *payload.SMTPUseTLS
@@ -574,16 +585,29 @@ func (s *Server) handleVerifyAccount(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Password is required for connection verification"})
 		return
 	}
-	if acc.SMTPUsername == "" {
-		acc.SMTPUsername = acc.IMAPUsername
-	}
-	if acc.SMTPPassword == "" {
-		acc.SMTPPassword = acc.IMAPPassword
-	}
+
+	s.logger.Info("account verification started",
+		"user", user.Subject,
+		"id", id,
+		"imap_host", acc.IMAPHost,
+		"smtp_host", acc.SMTPHost,
+	)
 
 	ctx, cancel := context.WithTimeout(r.Context(), verifyOverallTimeout)
 	defer cancel()
 	res := s.VerifyAccountCredentials(ctx, acc)
+	if res.Success {
+		s.logger.Info("account verification succeeded", "user", user.Subject, "id", id)
+	} else {
+		s.logger.Warn("account verification failed",
+			"user", user.Subject,
+			"id", id,
+			"imap_ok", res.IMAP.Success,
+			"imap_error", res.IMAP.Error,
+			"smtp_ok", res.SMTP.Success,
+			"smtp_error", res.SMTP.Error,
+		)
+	}
 	writeJSON(w, http.StatusOK, res)
 }
 

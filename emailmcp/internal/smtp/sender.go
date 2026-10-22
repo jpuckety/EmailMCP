@@ -61,10 +61,7 @@ func (s *Sender) SendMessage(ctx context.Context, acc *types.Account, msg mailbu
 		return nil, err
 	}
 
-	smtpPass := acc.SMTPPassword
-	if smtpPass == "" {
-		smtpPass = acc.IMAPPassword
-	}
+	smtpPass := acc.SMTPPass()
 	if smtpPass == "" {
 		return nil, types.AuthFailed("SMTP", errors.New("smtp password is required"))
 	}
@@ -73,7 +70,7 @@ func (s *Sender) SendMessage(ctx context.Context, acc *types.Account, msg mailbu
 		msg.From = acc.FromAddress
 	}
 	if msg.From == "" {
-		msg.From = acc.SMTPUsername
+		msg.From = acc.SMTPUser()
 	}
 	if msg.From == "" {
 		return nil, types.Validation("no from address available")
@@ -105,10 +102,7 @@ func (s *Sender) SendRaw(ctx context.Context, acc *types.Account, from string, r
 	if err := netutil.RequireTLSUnlessLocalhost(acc.SMTPHost, acc.SMTPUseTLS, "SMTP"); err != nil {
 		return nil, err
 	}
-	smtpPass := acc.SMTPPassword
-	if smtpPass == "" {
-		smtpPass = acc.IMAPPassword
-	}
+	smtpPass := acc.SMTPPass()
 	if smtpPass == "" {
 		return nil, types.AuthFailed("SMTP", errors.New("smtp password is required"))
 	}
@@ -116,7 +110,7 @@ func (s *Sender) SendRaw(ctx context.Context, acc *types.Account, from string, r
 		from = acc.FromAddress
 	}
 	if from == "" {
-		from = acc.SMTPUsername
+		from = acc.SMTPUser()
 	}
 	recipients = uniqueRecipients(recipients)
 	if len(recipients) == 0 {
@@ -127,7 +121,8 @@ func (s *Sender) SendRaw(ctx context.Context, acc *types.Account, from string, r
 	}
 
 	addr := fmt.Sprintf("%s:%d", acc.SMTPHost, acc.SMTPPort)
-	auth := smtp.PlainAuth("", acc.SMTPUsername, smtpPass, acc.SMTPHost)
+	implicitTLS := acc.SMTPUseTLS && acc.SMTPPort == 465
+	auth := NewAuth(acc.SMTPUser(), smtpPass, acc.SMTPHost, implicitTLS)
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, s.cfg.DefaultTimeout)
 	defer cancel()

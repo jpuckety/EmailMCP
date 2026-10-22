@@ -13,6 +13,7 @@ import (
 
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/netutil"
+	mailsmtp "github.com/jpuckett/EmailMCP/emailmcp/internal/smtp"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
@@ -146,18 +147,12 @@ func (s *Server) verifySMTP(ctx context.Context, acc *types.Account) ComponentVe
 		return ComponentVerification{Success: false, Error: "SMTP host is required"}
 	}
 
-	smtpUser := acc.SMTPUsername
-	if smtpUser == "" {
-		smtpUser = acc.IMAPUsername
-	}
+	smtpUser := acc.SMTPUser()
 	if smtpUser == "" {
 		return ComponentVerification{Success: false, Error: "SMTP username is required"}
 	}
 
-	smtpPass := acc.SMTPPassword
-	if smtpPass == "" {
-		smtpPass = acc.IMAPPassword
-	}
+	smtpPass := acc.SMTPPass()
 	if smtpPass == "" {
 		return ComponentVerification{Success: false, Error: "SMTP password is required for verification"}
 	}
@@ -238,7 +233,7 @@ func (s *Server) dialAndAuthSMTP(ctx context.Context, addr, host string, port in
 		}
 	}
 
-	auth := net_smtp.PlainAuth("", user, pass, host)
+	auth := mailsmtp.NewAuth(user, pass, host, implicitTLS)
 	if err := client.Auth(auth); err != nil {
 		return fmt.Errorf("SMTP authentication failed: %w", err)
 	}

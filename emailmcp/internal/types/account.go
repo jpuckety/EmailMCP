@@ -51,6 +51,28 @@ type Account struct {
 	WatchFolders []string `json:"watch_folders,omitempty"`
 }
 
+// SMTPUser returns the SMTP username, falling back to the IMAP username.
+func (a *Account) SMTPUser() string {
+	if a == nil {
+		return ""
+	}
+	if a.SMTPUsername != "" {
+		return a.SMTPUsername
+	}
+	return a.IMAPUsername
+}
+
+// SMTPPass returns the SMTP password, falling back to the IMAP password.
+func (a *Account) SMTPPass() string {
+	if a == nil {
+		return ""
+	}
+	if a.SMTPPassword != "" {
+		return a.SMTPPassword
+	}
+	return a.IMAPPassword
+}
+
 // MaxWatchFolders is the maximum number of IMAP folders an account may watch.
 const MaxWatchFolders = 8
 

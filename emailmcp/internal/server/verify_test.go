@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +139,29 @@ func TestVerifyAccountCredentials_MissingFields(t *testing.T) {
 	})
 	if res.SMTP.Error != "SMTP username is required" {
 		t.Errorf("unexpected error for missing SMTP username: %s", res.SMTP.Error)
+	}
+}
+
+func TestVerifyAccountCredentials_SMTPFallsBackToIMAPCredentials(t *testing.T) {
+	srv := &Server{}
+	res := srv.VerifyAccountCredentials(context.Background(), &types.Account{
+		IMAPHost:     "imap.gmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "user@gmail.com",
+		IMAPPassword: "password123",
+		IMAPUseTLS:   true,
+		SMTPHost:     "10.0.0.1",
+		SMTPPort:     587,
+		SMTPUseTLS:   true,
+	})
+	if res.SMTP.Error == "SMTP password is required for verification" {
+		t.Fatal("expected empty SMTP password to fall back to IMAP password")
+	}
+	if res.SMTP.Error == "SMTP username is required" {
+		t.Fatal("expected empty SMTP username to fall back to IMAP username")
+	}
+	if !strings.Contains(res.SMTP.Error, "not allowed") {
+		t.Fatalf("expected SSRF error after credential fallback, got %q", res.SMTP.Error)
 	}
 }
 
