@@ -70,20 +70,7 @@ func (s *Server) composeMessage(ctx context.Context, acc *types.Account, in Comp
 		}
 		mailbuild.ApplyReply(&msg, orig, in.ReplyAll, mailbuild.OwnAddresses(acc))
 		if in.QuoteOriginal {
-			from := ""
-			if len(orig.From) > 0 {
-				from = orig.From[0].Address
-			}
-			date := ""
-			if !orig.Date.IsZero() {
-				date = orig.Date.Format("Mon, 02 Jan 2006 15:04:05 -0700")
-			}
-			if orig.Text != "" || msg.Text != "" {
-				msg.Text += mailbuild.QuotePlain(from, date, orig.Text)
-			}
-			if orig.HTML != "" || msg.HTML != "" {
-				msg.HTML += mailbuild.QuoteHTML(from, date, orig.HTML)
-			}
+			mailbuild.QuoteOriginal(&msg, orig)
 		}
 	}
 

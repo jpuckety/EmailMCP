@@ -2,6 +2,7 @@ package mailbuild
 
 import (
 	"fmt"
+	"html"
 	"net/mail"
 	"regexp"
 	"strings"
@@ -10,7 +11,16 @@ import (
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
-var replyFwdPrefix = regexp.MustCompile(`(?i)^\s*((re|fwd|fw)\s*(\[\d+\])?\s*:)+\s*`)
+var (
+	replyFwdPrefix  = regexp.MustCompile(`(?i)^\s*((re|fwd|fw)\s*(\[\d+\])?\s*:)+\s*`)
+	htmlDoctypeRe   = regexp.MustCompile(`(?is)<!DOCTYPE[^>]*>`)
+	htmlHeadRe      = regexp.MustCompile(`(?is)<head\b[^>]*>.*?</head>`)
+	htmlBodyOpenRe  = regexp.MustCompile(`(?is)<body\b[^>]*>`)
+	htmlBodyCloseRe = regexp.MustCompile(`(?is)</body\s*>`)
+	htmlOpenRe      = regexp.MustCompile(`(?is)<html\b[^>]*>`)
+	htmlCloseRe     = regexp.MustCompile(`(?is)</html\s*>`)
+	htmlStyleRe     = regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`)
+)
 
 // StripSubjectPrefix removes stacked Re:/Fwd:/FW: prefixes.
 func StripSubjectPrefix(subject string) string {
@@ -72,22 +82,87 @@ func QuotePlain(originalFrom, originalDate, originalText string) string {
 	return b.String()
 }
 
-// QuoteHTML wraps the original HTML in a blockquote.
-func QuoteHTML(originalFrom, originalDate, originalHTML string) string {
-	esc := func(s string) string {
-		s = strings.ReplaceAll(s, "&", "&amp;")
-		s = strings.ReplaceAll(s, "<", "&lt;")
-		s = strings.ReplaceAll(s, ">", "&gt;")
-		return s
+// TextToHTML escapes plain text and converts line breaks to <br> so a
+// text-only note can be placed above a quoted HTML original.
+func TextToHTML(text string) string {
+	if text == "" {
+		return ""
 	}
+	s := strings.ReplaceAll(text, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = html.EscapeString(s)
+	return strings.ReplaceAll(s, "\n", "<br>\r\n")
+}
+
+// QuoteHTML wraps the original HTML in a blockquote.
+// Full documents are reduced to inner <body> content (plus <style> from <head>)
+// so <!DOCTYPE>/<html>/<head> are not nested inside the quote.
+func QuoteHTML(originalFrom, originalDate, originalHTML string) string {
 	var b strings.Builder
 	b.WriteString(`<br><blockquote type="cite">`)
 	if originalFrom != "" || originalDate != "" {
-		fmt.Fprintf(&b, "<p>On %s, %s wrote:</p>", esc(originalDate), esc(originalFrom))
+		fmt.Fprintf(&b, "<p>On %s, %s wrote:</p>", html.EscapeString(originalDate), html.EscapeString(originalFrom))
 	}
-	b.WriteString(originalHTML)
+	b.WriteString(htmlInnerContent(originalHTML))
 	b.WriteString("</blockquote>")
 	return b.String()
+}
+
+func htmlInnerContent(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return raw
+	}
+	var styles strings.Builder
+	if head := htmlHeadRe.FindString(s); head != "" {
+		for _, st := range htmlStyleRe.FindAllString(head, -1) {
+			styles.WriteString(st)
+		}
+	}
+	if loc := htmlBodyOpenRe.FindStringIndex(s); loc != nil {
+		rest := s[loc[1]:]
+		if end := htmlBodyCloseRe.FindStringIndex(rest); end != nil {
+			rest = rest[:end[0]]
+		}
+		return styles.String() + rest
+	}
+	out := htmlDoctypeRe.ReplaceAllString(s, "")
+	out = htmlHeadRe.ReplaceAllString(out, "")
+	out = htmlOpenRe.ReplaceAllString(out, "")
+	out = htmlCloseRe.ReplaceAllString(out, "")
+	return styles.String() + out
+}
+
+// QuoteOriginal appends a quoted copy of orig below msg's note.
+// When an HTML part will be produced and msg.HTML is empty, a text-only note
+// is converted to HTML so clients that show the HTML part still see it.
+func QuoteOriginal(msg *Message, orig *types.EmailMessage) {
+	if msg == nil || orig == nil {
+		return
+	}
+	from := strings.Join(addressesToStrings(orig.From), ", ")
+	date := ""
+	if !orig.Date.IsZero() {
+		date = orig.Date.Format("Mon, 02 Jan 2006 15:04:05 -0700")
+	}
+	appendQuote(msg, from, date, orig.Text, orig.HTML)
+}
+
+func appendQuote(msg *Message, originalFrom, originalDate, originalText, originalHTML string) {
+	if msg == nil {
+		return
+	}
+	noteText, noteHTML := msg.Text, msg.HTML
+	if noteText != "" || originalText != "" {
+		msg.Text = noteText + QuotePlain(originalFrom, originalDate, originalText)
+	}
+	if noteHTML != "" || originalHTML != "" {
+		prefix := noteHTML
+		if prefix == "" && noteText != "" {
+			prefix = TextToHTML(noteText)
+		}
+		msg.HTML = prefix + QuoteHTML(originalFrom, originalDate, originalHTML)
+	}
 }
 
 func parseTime(s string) time.Time {
@@ -207,17 +282,7 @@ func ApplyForward(msg *Message, orig *types.EmailMessage, quote bool) {
 	if !quote {
 		return
 	}
-	from := strings.Join(addressesToStrings(orig.From), ", ")
-	date := ""
-	if !orig.Date.IsZero() {
-		date = orig.Date.Format("Mon, 02 Jan 2006 15:04:05 -0700")
-	}
-	if orig.Text != "" || msg.Text != "" {
-		msg.Text = msg.Text + QuotePlain(from, date, orig.Text)
-	}
-	if orig.HTML != "" || msg.HTML != "" {
-		msg.HTML = msg.HTML + QuoteHTML(from, date, orig.HTML)
-	}
+	QuoteOriginal(msg, orig)
 }
 
 func origMessageID(orig *types.EmailMessage) string {

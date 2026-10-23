@@ -17,6 +17,12 @@ Omit `subject` unless you need to override it. It defaults to `Fwd:` plus the or
 
 Write only the new commentary in `text`/`html`. Do not paste the original yourself when `quote_original` is true.
 
+### `text` and `html`
+
+- If you pass only `text`, that note is the `text/plain` part. When an HTML part is also produced (the original has HTML, or you passed `html`), the server converts the note to HTML (escaped, line breaks to `<br>`) and places it above the quoted original so mail apps that show HTML still display it.
+- If you pass both `text` and `html`, each is used for its own part. The server does not copy `text` into the HTML part.
+- Quoted original HTML is the inner `<body>` content. `<!DOCTYPE>`, `<html>`, and `<head>` are dropped so a full document is not nested inside the blockquote. `<style>` from the original head is kept with the quote.
+
 ## Original attachments
 
 `include_original_attachments` applies **only when forwarding**. When omitted, it defaults to **true**: the server re-attaches non-inline parts from the original.

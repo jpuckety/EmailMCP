@@ -28,6 +28,8 @@ Set `reply_all: true` to also copy the original To/Cc into `cc`, minus the accou
 
 Write only the new reply in `text`/`html`. Do not paste the original yourself when `quote_original` is true.
 
+If you pass only `text` and an HTML part is produced (the original has HTML, or you passed `html`), the server converts the note to HTML and places it above the quote. If you pass both `text` and `html`, each is used for its own part. Quoted original HTML is the inner `<body>` (plus `<style>` from `<head>`), not a nested full document.
+
 ## Attachments
 
 The server does not copy files from the original message on reply. To add new files, pass them in `attachments` as you would for a new message.
