@@ -6,11 +6,22 @@
  * `<IMAGE1_NAME>`, and drop the placeholder entryPoint/command so the real
  * image ENTRYPOINT runs. The volume-init sidecar is left unchanged.
  *
- * Usage: node prepare-taskdef.js [input.json] > taskdef.json
+ * Usage: node prepare-taskdef.js [input.json] [family-or-container] > taskdef.json
  */
 
 const APP_CONTAINER_NAME = 'email-mcp';
 const IMAGE_PLACEHOLDER = '<IMAGE1_NAME>';
+const NOTIFY_COMMAND = ['-transport', 'notify'];
+
+const CODE_DEPLOY_TARGETS = [
+  { family: 'email-mcp', containerName: 'email-mcp', containerPort: 8080 },
+  {
+    family: 'email-mcp-notify',
+    containerName: 'email-mcp-notify',
+    containerPort: 8080,
+    command: NOTIFY_COMMAND,
+  },
+];
 
 const STRIP_FIELDS = [
   'taskDefinitionArn',
@@ -71,16 +82,49 @@ function clearAppPlaceholderOverride(td, containerName) {
   return td;
 }
 
+function setAppCommand(td, containerName, command) {
+  const name = containerName || APP_CONTAINER_NAME;
+  if (!Array.isArray(td.containerDefinitions)) {
+    return td;
+  }
+  for (const container of td.containerDefinitions) {
+    if (container.name === name) {
+      delete container.entryPoint;
+      container.command = command;
+    }
+  }
+  return td;
+}
+
+function targetFor(name) {
+  if (!name) {
+    return CODE_DEPLOY_TARGETS[0];
+  }
+  return (
+    CODE_DEPLOY_TARGETS.find((target) => target.family === name || target.containerName === name) || {
+      family: name,
+      containerName: name,
+      containerPort: 8080,
+    }
+  );
+}
+
 function prepareTaskdef(input, options) {
   const opts = options || {};
+  const target = targetFor(opts.containerName || opts.family);
+  const containerName = opts.containerName || target.containerName;
   const td = stripRegisteredFields(unwrapTaskDefinition(input));
-  substituteAppImage(td, opts.placeholder, opts.containerName);
-  return clearAppPlaceholderOverride(td, opts.containerName);
+  substituteAppImage(td, opts.placeholder, containerName);
+  if (opts.command || target.command) {
+    return setAppCommand(td, containerName, opts.command || target.command);
+  }
+  return clearAppPlaceholderOverride(td, containerName);
 }
 
 function appspecYaml(containerName, containerPort) {
-  const name = containerName || APP_CONTAINER_NAME;
-  const port = containerPort || 8080;
+  const target = targetFor(containerName);
+  const name = containerName || target.containerName || APP_CONTAINER_NAME;
+  const port = containerPort || target.containerPort || 8080;
   return [
     'version: 0.0',
     'Resources:',
@@ -98,10 +142,13 @@ function appspecYaml(containerName, containerPort) {
 module.exports = {
   APP_CONTAINER_NAME,
   IMAGE_PLACEHOLDER,
+  CODE_DEPLOY_TARGETS,
   unwrapTaskDefinition,
   stripRegisteredFields,
   substituteAppImage,
   clearAppPlaceholderOverride,
+  setAppCommand,
+  targetFor,
   prepareTaskdef,
   appspecYaml,
 };
@@ -109,6 +156,8 @@ module.exports = {
 if (require.main === module) {
   const fs = require('fs');
   const path = process.argv[2];
+  const targetName = process.argv[3];
   const raw = path ? fs.readFileSync(path, 'utf8') : fs.readFileSync(0, 'utf8');
-  process.stdout.write(JSON.stringify(prepareTaskdef(JSON.parse(raw)), null, 2) + '\n');
+  const opts = targetName ? { family: targetName, containerName: targetFor(targetName).containerName } : {};
+  process.stdout.write(JSON.stringify(prepareTaskdef(JSON.parse(raw), opts), null, 2) + '\n');
 }

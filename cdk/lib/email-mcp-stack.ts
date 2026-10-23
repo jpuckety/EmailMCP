@@ -7,7 +7,6 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
-import * as cr from 'aws-cdk-lib/custom-resources';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
@@ -26,8 +25,10 @@ export const TASK_FAMILY = 'email-mcp';
 export const NOTIFY_TASK_FAMILY = 'email-mcp-notify';
 export const NOTIFY_SERVICE_NAME = 'email-mcp-notify';
 export const NOTIFY_CONTAINER_NAME = 'email-mcp-notify';
-/** SSM parameter holding the notify service image. Pipeline env deploys omit imageUri; promotion writes this so later stack updates do not revert to busybox. */
-export const NOTIFY_IMAGE_PARAMETER_NAME = '/email-mcp/notify/image-uri';
+/** Private ALB listener used only for CodeDeploy blue/green health (not public). */
+export const NOTIFY_LISTENER_PORT = 8081;
+export const NOTIFY_CODEDEPLOY_APPLICATION_NAME = 'email-mcp-notify';
+export const NOTIFY_CODEDEPLOY_DEPLOYMENT_GROUP_NAME = 'email-mcp-notify';
 /** CPU/memory for IMAP IDLE (up to 8 folders per account). */
 export const NOTIFY_TASK_CPU = 512;
 export const NOTIFY_TASK_MEMORY_MIB = 1024;
@@ -43,10 +44,6 @@ export const PLACEHOLDER_IMAGE = 'public.ecr.aws/docker/library/busybox:1.36';
 /** Foreground httpd on the writable `/tmp` volume. Stripped by prepare-taskdef before CodeDeploy. */
 export const PLACEHOLDER_APP_COMMAND =
   'mkdir -p /tmp/www && printf \'ok\\n\' > /tmp/www/health && exec httpd -f -p 8080 -h /tmp/www';
-/** Runs the watcher when `/app/emailmcp` exists; otherwise busybox httpd so `/health` stays green. */
-export const NOTIFY_BOOTSTRAP_COMMAND =
-  'if [ -x /app/emailmcp ]; then exec /app/emailmcp -transport notify; ' +
-  'else mkdir -p /tmp/www && printf \'ok\\n\' > /tmp/www/health && exec httpd -f -p 8080 -h /tmp/www; fi';
 
 export interface EmailMcpStackProps extends cdk.StackProps {
   readonly hostname?: string;
@@ -60,9 +57,9 @@ export interface EmailMcpStackProps extends cdk.StackProps {
 
 /**
  * Deploys email-mcp on ECS Fargate behind an (HTTPS) Application Load Balancer with CodeDeploy
- * blue/green, a second rolling Fargate service for IMAP IDLE notifications, an ECR repository
- * import, DynamoDB tables encrypted by a customer-managed KMS key, a task IAM role granting
- * scoped KMS + DynamoDB access, and SSM SecureString-backed secrets.
+ * blue/green, a second CodeDeploy blue/green Fargate service for IMAP IDLE notifications, an ECR
+ * repository import, DynamoDB tables encrypted by a customer-managed KMS key, a task IAM role
+ * granting scoped KMS + DynamoDB access, and SSM SecureString-backed secrets.
  */
 export class EmailMcpStack extends cdk.Stack {
   public readonly repository: ecr.IRepository;
@@ -433,92 +430,28 @@ export class EmailMcpStack extends cdk.Stack {
       deploymentConfig: codedeploy.EcsDeploymentConfig.ALL_AT_ONCE,
     });
 
-    const notifyImageParamArn = cdk.Stack.of(this).formatArn({
-      service: 'ssm',
-      resource: 'parameter',
-      resourceName: NOTIFY_IMAGE_PARAMETER_NAME.replace(/^\//, ''),
+    const notifyBlueTargetGroup = new elbv2.ApplicationTargetGroup(this, 'NotifyBlueTargetGroup', {
+      vpc,
+      port: APP_CONTAINER_PORT,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targetType: elbv2.TargetType.IP,
+      healthCheck,
+      deregistrationDelay: cdk.Duration.seconds(30),
     });
-    // Creates /email-mcp/notify/image-uri on first deploy. No onDelete: a stack
-    // delete leaves the parameter (and any promoted digest) in the account.
-    const notifyImageInit = new cr.AwsCustomResource(this, 'NotifyImageUriInit', {
-      installLatestAwsSdk: false,
-      onCreate: {
-        service: 'SSM',
-        action: 'putParameter',
-        parameters: {
-          Name: NOTIFY_IMAGE_PARAMETER_NAME,
-          Value: imageUri,
-          Type: 'String',
-          Overwrite: !usingPlaceholder,
-        },
-        ignoreErrorCodesMatching: 'ParameterAlreadyExists',
-        physicalResourceId: cr.PhysicalResourceId.of(NOTIFY_IMAGE_PARAMETER_NAME),
-      },
-      onUpdate: usingPlaceholder
-        ? {
-            service: 'SSM',
-            action: 'getParameter',
-            parameters: { Name: NOTIFY_IMAGE_PARAMETER_NAME },
-            physicalResourceId: cr.PhysicalResourceId.of(NOTIFY_IMAGE_PARAMETER_NAME),
-            outputPaths: ['Parameter.Value'],
-            logging: cr.Logging.withDataHidden(),
-          }
-        : {
-            service: 'SSM',
-            action: 'putParameter',
-            parameters: {
-              Name: NOTIFY_IMAGE_PARAMETER_NAME,
-              Value: imageUri,
-              Type: 'String',
-              Overwrite: true,
-            },
-            physicalResourceId: cr.PhysicalResourceId.of(NOTIFY_IMAGE_PARAMETER_NAME),
-          },
-      policy: cr.AwsCustomResourcePolicy.fromStatements([
-        new iam.PolicyStatement({
-          actions: ['ssm:PutParameter', 'ssm:GetParameter'],
-          resources: [notifyImageParamArn],
-        }),
-      ]),
+    const notifyGreenTargetGroup = new elbv2.ApplicationTargetGroup(this, 'NotifyGreenTargetGroup', {
+      vpc,
+      port: APP_CONTAINER_PORT,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targetType: elbv2.TargetType.IP,
+      healthCheck,
+      deregistrationDelay: cdk.Duration.seconds(30),
     });
-
-    // Image must be a provisioning-time GetAtt, not AWS::SSM::Parameter::Value.
-    // CFN resolves typed SSM parameters at CreateStack/UpdateStack validation,
-    // before NotifyImageUriInit can create a missing parameter.
-    // Nonce forces Lookup to re-run every deploy so a promoted digest in SSM is
-    // picked up and a later env-stack deploy does not bake the first-deploy
-    // placeholder GetAtt back into the task definition.
-    const notifyImageRefresh = Date.now().toString();
-    const notifyImageLookup = new cr.AwsCustomResource(this, 'NotifyImageUriLookup', {
-      installLatestAwsSdk: false,
-      onCreate: {
-        service: 'SSM',
-        action: 'getParameter',
-        parameters: { Name: NOTIFY_IMAGE_PARAMETER_NAME },
-        physicalResourceId: cr.PhysicalResourceId.of(`${NOTIFY_IMAGE_PARAMETER_NAME}:${notifyImageRefresh}`),
-        outputPaths: ['Parameter.Value'],
-        logging: cr.Logging.withDataHidden(),
-      },
-      onUpdate: {
-        service: 'SSM',
-        action: 'getParameter',
-        parameters: { Name: NOTIFY_IMAGE_PARAMETER_NAME },
-        physicalResourceId: cr.PhysicalResourceId.of(`${NOTIFY_IMAGE_PARAMETER_NAME}:${notifyImageRefresh}`),
-        outputPaths: ['Parameter.Value'],
-        logging: cr.Logging.withDataHidden(),
-      },
-      policy: cr.AwsCustomResourcePolicy.fromStatements([
-        new iam.PolicyStatement({
-          actions: ['ssm:GetParameter'],
-          resources: [notifyImageParamArn],
-        }),
-      ]),
+    const notifyListener = this.loadBalancer.addListener('NotifyListener', {
+      port: NOTIFY_LISTENER_PORT,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      open: false,
+      defaultAction: elbv2.ListenerAction.forward([notifyBlueTargetGroup]),
     });
-    notifyImageLookup.node.addDependency(notifyImageInit);
-
-    const notifyImage = ecs.ContainerImage.fromRegistry(
-      usingPlaceholder ? notifyImageLookup.getResponseField('Parameter.Value') : imageUri,
-    );
 
     const notifyTaskDefinition = new ecs.FargateTaskDefinition(this, 'NotifyTaskDef', {
       family: NOTIFY_TASK_FAMILY,
@@ -531,7 +464,6 @@ export class EmailMcpStack extends cdk.Stack {
         operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
       },
     });
-    notifyTaskDefinition.node.addDependency(notifyImageLookup);
 
     const notifyLogDriver = ecs.LogDrivers.awsLogs({ streamPrefix: 'email-mcp-notify', logGroup });
     const notifyHealthCheck: ecs.HealthCheck = {
@@ -543,13 +475,13 @@ export class EmailMcpStack extends cdk.Stack {
     };
     const notifyContainer = notifyTaskDefinition.addContainer('NotifyApp', {
       containerName: NOTIFY_CONTAINER_NAME,
-      image: notifyImage,
+      image,
       portMappings: [{ containerPort: APP_CONTAINER_PORT }],
       logging: notifyLogDriver,
       essential: true,
       healthCheck: notifyHealthCheck,
       ...(usingPlaceholder
-        ? { entryPoint: ['sh', '-c'], command: [NOTIFY_BOOTSTRAP_COMMAND] }
+        ? { entryPoint: ['sh', '-c'], command: [PLACEHOLDER_APP_COMMAND] }
         : { command: ['-transport', 'notify'] }),
       environment: {
         EMAILMCP_LISTEN_ADDR: `:${APP_CONTAINER_PORT}`,
@@ -567,7 +499,7 @@ export class EmailMcpStack extends cdk.Stack {
     notifyContainer.addMountPoints({ sourceVolume: 'tmp', containerPath: '/tmp', readOnly: false });
 
     const notifyVolumeInit = notifyTaskDefinition.addContainer('NotifyVolumeInit', {
-      image: notifyImage,
+      image,
       containerName: 'volume-init',
       user: 'root',
       essential: false,
@@ -587,17 +519,39 @@ export class EmailMcpStack extends cdk.Stack {
       cfnNotifyTaskDefinition.addPropertyOverride(`ContainerDefinitions.${index}.ReadonlyRootFilesystem`, true);
     }
 
-    this.notifyService = new ecs.FargateService(this, 'NotifyService', {
+    this.notifyService = new ecs.FargateService(this, 'NotifyBlueGreenService', {
       cluster: this.cluster,
       serviceName: NOTIFY_SERVICE_NAME,
       taskDefinition: notifyTaskDefinition,
       desiredCount: 1,
-      minHealthyPercent: 100,
+      minHealthyPercent: 0,
       maxHealthyPercent: 200,
       assignPublicIp: false,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       enableExecuteCommand: false,
-      circuitBreaker: { rollback: true },
+      healthCheckGracePeriod: cdk.Duration.seconds(120),
+      deploymentController: { type: ecs.DeploymentControllerType.CODE_DEPLOY },
+    });
+    this.notifyService.attachToApplicationTargetGroup(notifyBlueTargetGroup);
+    this.notifyService.connections.allowFrom(this.loadBalancer, ec2.Port.tcp(APP_CONTAINER_PORT));
+
+    const cfnNotifyService = this.notifyService.node.defaultChild as ecs.CfnService;
+    cfnNotifyService.taskDefinition = NOTIFY_TASK_FAMILY;
+
+    const notifyApplication = new codedeploy.EcsApplication(this, 'NotifyCodeDeployApplication', {
+      applicationName: NOTIFY_CODEDEPLOY_APPLICATION_NAME,
+    });
+    new codedeploy.EcsDeploymentGroup(this, 'NotifyDeploymentGroup', {
+      application: notifyApplication,
+      deploymentGroupName: NOTIFY_CODEDEPLOY_DEPLOYMENT_GROUP_NAME,
+      service: this.notifyService,
+      blueGreenDeploymentConfig: {
+        blueTargetGroup: notifyBlueTargetGroup,
+        greenTargetGroup: notifyGreenTargetGroup,
+        listener: notifyListener,
+      },
+      autoRollback: { failedDeployment: true },
+      deploymentConfig: codedeploy.EcsDeploymentConfig.ALL_AT_ONCE,
     });
 
     const wafManagedRuleExcludedPaths = ['/mcp', '/sse', '/oauth/register', '/oauth/authorize', '/oauth/token'];
@@ -854,23 +808,12 @@ export class EmailMcpStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ClusterName', { value: this.cluster.clusterName });
     new cdk.CfnOutput(this, 'ServiceName', { value: this.service.serviceName });
     new cdk.CfnOutput(this, 'NotifyServiceName', { value: this.notifyService.serviceName });
-    new cdk.CfnOutput(this, 'NotifyImageParameterName', { value: NOTIFY_IMAGE_PARAMETER_NAME });
     new cdk.CfnOutput(this, 'CodeDeployApplicationName', { value: CODEDEPLOY_APPLICATION_NAME });
     new cdk.CfnOutput(this, 'CodeDeployDeploymentGroupName', { value: CODEDEPLOY_DEPLOYMENT_GROUP_NAME });
-
-    if (usingPlaceholder) {
-      cdk.Annotations.of(this).addWarning(
-        `MCPCICD CdkDev/CdkProd omit imageUri, so email-mcp-notify does not receive the promoted digest automatically. ` +
-          `Dev CdkDev runs before Build (no Promote stage); Prod order is CdkProd before Promote before DeployProd, and DeployProd CodeDeploys only email-mcp. Both env-stack stages still omit imageUri. ` +
-          `The notify image is a provisioning-time GetAtt of SSM ${NOTIFY_IMAGE_PARAMETER_NAME} (initialized to the busybox placeholder and not overwritten on later env-stack deploys). ` +
-          `Until that parameter holds a real email-mcp digest, the service is inert: GET /health succeeds but it does not IDLE or POST webhooks. ` +
-          `After Dev Build or Prod Promote, write the digest from that environment account to ${NOTIFY_IMAGE_PARAMETER_NAME}; for Prod do this after Promote using the Prod-account digest. To run it immediately, copy the current ${NOTIFY_TASK_FAMILY} revision and change only the image of both ${NOTIFY_CONTAINER_NAME} and volume-init (keep the bootstrap entryPoint/command). ` +
-          `Do not replace the command with -transport notify while entryPoint is still sh -c. ` +
-          `--force-new-deployment alone does not change a URI already baked into the running revision. ` +
-          `The next EmailMcpStack deploy re-reads SSM and updates the notify task definition image; a bad digest can fail the notify circuit breaker and roll back the whole stack (including HTTP) until SSM is fixed. ` +
-          `Break-glass: cdk deploy -c imageUri=<digest> bakes that digest and overwrites SSM; also pass the same -c hostname, -c pipelineAccount, -c containerEnv, and hosted-zone context (hostedZoneName/hostedZoneId) as MCPCICD. Omitting pipelineAccount can remove pipeline SSM parameters/role outputs, and omitting containerEnv drops environment task settings.`,
-      );
-    }
+    new cdk.CfnOutput(this, 'NotifyCodeDeployApplicationName', { value: NOTIFY_CODEDEPLOY_APPLICATION_NAME });
+    new cdk.CfnOutput(this, 'NotifyCodeDeployDeploymentGroupName', {
+      value: NOTIFY_CODEDEPLOY_DEPLOYMENT_GROUP_NAME,
+    });
 
     if (!certificate) {
       cdk.Annotations.of(this).addWarning(

@@ -69,4 +69,37 @@ describe('prepare-taskdef', () => {
     expect(yaml).toContain('ContainerName: "email-mcp"');
     expect(yaml).toContain('ContainerPort: 8080');
   });
+
+  test('prepare-taskdef for notify substitutes image and sets -transport notify', () => {
+    const liveNotify = {
+      taskDefinition: {
+        ...liveDescribe.taskDefinition,
+        family: 'email-mcp-notify',
+        containerDefinitions: [
+          {
+            name: 'email-mcp-notify',
+            image: '222222222222.dkr.ecr.us-east-1.amazonaws.com/email-mcp@sha256:aaa',
+            essential: true,
+            entryPoint: ['sh', '-c'],
+            command: ['mkdir -p /tmp/www && httpd -f -p 8080 -h /tmp/www'],
+            environment: [{ name: 'EMAILMCP_TRANSPORT', value: 'notify' }],
+          },
+          {
+            name: 'volume-init',
+            image: 'public.ecr.aws/docker/library/busybox:1.36',
+            essential: false,
+            command: ['chown 10001:10001 /tmp'],
+          },
+        ],
+      },
+    };
+    const td = prepareTaskdef(liveNotify, { family: 'email-mcp-notify' });
+    const app = td.containerDefinitions.find((c: { name: string }) => c.name === 'email-mcp-notify');
+    const init = td.containerDefinitions.find((c: { name: string }) => c.name === 'volume-init');
+    expect(app.image).toBe('<IMAGE1_NAME>');
+    expect(app.entryPoint).toBeUndefined();
+    expect(app.command).toEqual(['-transport', 'notify']);
+    expect(init.image).toBe('public.ecr.aws/docker/library/busybox:1.36');
+    expect(appspecYaml('email-mcp-notify')).toContain('ContainerName: "email-mcp-notify"');
+  });
 });

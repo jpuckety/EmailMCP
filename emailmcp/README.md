@@ -85,11 +85,10 @@ Watching starts for accounts that have a webhook URL and IMAP password. Empty
 `watch_folders` means INBOX + the account's Sent folder (IMAP special-use).
 Locally, omit `EMAILMCP_NOTIFY_STATE_TABLE` to use in-memory leases (not for
 production). On ECS the table is required. MCPCICD env-stack deploys omit
-`imageUri`; the notify image is a GetAtt of SSM `/email-mcp/notify/image-uri`
-and stays the busybox placeholder until Dev Build or Prod Promote is followed
-by writing that parameter (see the repo-root README pipeline contract). Do not
-replace the bootstrap command with `-transport notify` while `entryPoint` is
-`sh -c`.
+`imageUri`; both `email-mcp` and `email-mcp-notify` start as the busybox
+`/health` placeholder until `DeployDev`/`DeployProd` CodeDeploy the promoted
+digest (notify with `-transport notify`). See the repo-root README pipeline
+contract.
 
 The watcher has no write path for accounts, so it **requires the shared DynamoDB
 user-config table** (`EMAILMCP_USER_CONFIG_TABLE`, also used by the HTTP server

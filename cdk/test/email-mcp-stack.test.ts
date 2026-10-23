@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
-import { Annotations, Match, Template } from 'aws-cdk-lib/assertions';
+import { Match, Template } from 'aws-cdk-lib/assertions';
 import {
   APP_CONTAINER_NAME,
   APP_CONTAINER_PORT,
@@ -10,14 +10,16 @@ import {
   CODEDEPLOY_APPLICATION_NAME,
   ECR_REPOSITORY_NAME,
   ECR_PUSH_ROLE_NAME,
-  NOTIFY_BOOTSTRAP_COMMAND,
+  NOTIFY_CODEDEPLOY_APPLICATION_NAME,
+  NOTIFY_CODEDEPLOY_DEPLOYMENT_GROUP_NAME,
   NOTIFY_CONTAINER_NAME,
-  NOTIFY_IMAGE_PARAMETER_NAME,
+  NOTIFY_LISTENER_PORT,
   NOTIFY_SERVICE_NAME,
   NOTIFY_TASK_CPU,
   NOTIFY_TASK_FAMILY,
   NOTIFY_TASK_MEMORY_MIB,
   PIPELINE_DEPLOY_ROLE_NAME,
+  PLACEHOLDER_APP_COMMAND,
   PLACEHOLDER_IMAGE,
   TASK_FAMILY,
 } from '../lib/email-mcp-stack';
@@ -130,7 +132,7 @@ describe('EmailMcpStack', () => {
       TaskDefinition: TASK_FAMILY,
     });
 
-    template.resourceCountIs('AWS::ElasticLoadBalancingV2::TargetGroup', 2);
+    template.resourceCountIs('AWS::ElasticLoadBalancingV2::TargetGroup', 4);
     template.hasResourceProperties('AWS::ElasticLoadBalancingV2::TargetGroup', {
       HealthCheckPath: APP_HEALTH_CHECK_PATH,
       Port: APP_CONTAINER_PORT,
@@ -145,7 +147,12 @@ describe('EmailMcpStack', () => {
       ApplicationName: CODEDEPLOY_APPLICATION_NAME,
       ComputePlatform: 'ECS',
     });
-    template.resourceCountIs('AWS::CodeDeploy::DeploymentGroup', 1);
+    template.hasResourceProperties('AWS::CodeDeploy::Application', {
+      ApplicationName: NOTIFY_CODEDEPLOY_APPLICATION_NAME,
+      ComputePlatform: 'ECS',
+    });
+    template.resourceCountIs('AWS::CodeDeploy::Application', 2);
+    template.resourceCountIs('AWS::CodeDeploy::DeploymentGroup', 2);
 
     expect(json).not.toMatch(/DockerImageAsset/);
     expect(json).not.toMatch(/aws:cdk:path:.+ImageAsset/);
@@ -281,18 +288,18 @@ describe('EmailMcpStack', () => {
     expect(JSON.stringify(template.findResources('AWS::IAM::Policy'))).toContain('NotifyStateTable');
   });
 
-  test('email-mcp-notify is an ECS rolling service without ALB or CodeDeploy', () => {
+  test('email-mcp-notify is a CODE_DEPLOY blue/green service on a private ALB listener', () => {
     const template = synth();
 
     template.resourceCountIs('AWS::ECS::Service', 2);
-    template.resourceCountIs('AWS::CodeDeploy::DeploymentGroup', 1);
+    template.resourceCountIs('AWS::CodeDeploy::DeploymentGroup', 2);
     template.hasResourceProperties('AWS::ECS::Service', {
       ServiceName: NOTIFY_SERVICE_NAME,
       DesiredCount: 1,
       LaunchType: 'FARGATE',
-      DeploymentController: { Type: 'ECS' },
+      DeploymentController: { Type: 'CODE_DEPLOY' },
       EnableExecuteCommand: false,
-      LoadBalancers: Match.absent(),
+      TaskDefinition: NOTIFY_TASK_FAMILY,
       NetworkConfiguration: {
         AwsvpcConfiguration: {
           AssignPublicIp: 'DISABLED',
@@ -302,6 +309,13 @@ describe('EmailMcpStack', () => {
     template.hasResourceProperties('AWS::ECS::Service', {
       DeploymentController: { Type: 'CODE_DEPLOY' },
       TaskDefinition: TASK_FAMILY,
+    });
+    template.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+      Port: NOTIFY_LISTENER_PORT,
+      Protocol: 'HTTP',
+    });
+    template.hasResourceProperties('AWS::CodeDeploy::DeploymentGroup', {
+      DeploymentGroupName: NOTIFY_CODEDEPLOY_DEPLOYMENT_GROUP_NAME,
     });
   });
 
@@ -315,13 +329,9 @@ describe('EmailMcpStack', () => {
 
     const notify = containerByName(taskDefByFamily(template, NOTIFY_TASK_FAMILY), NOTIFY_CONTAINER_NAME);
     expect(notify.Essential).toBe(true);
-    expect(JSON.stringify(template.toJSON())).toContain(NOTIFY_IMAGE_PARAMETER_NAME);
-    expect(JSON.stringify(notify.Image)).toMatch(/Fn::GetAtt/);
-    expect(JSON.stringify(notify.Image)).toMatch(/Parameter\.Value/);
-    expect(JSON.stringify(notify.Image)).not.toMatch(/SsmParameterValue/);
-    expect(notify.Image).not.toBe(PLACEHOLDER_IMAGE);
+    expect(notify.Image).toBe(PLACEHOLDER_IMAGE);
     expect(notify.HealthCheck.Command.join(' ')).toMatch(/health/);
-    expect(notify.Command).toEqual([NOTIFY_BOOTSTRAP_COMMAND]);
+    expect(notify.Command).toEqual([PLACEHOLDER_APP_COMMAND]);
     expect(notify.Secrets).toBeUndefined();
 
     const env = envMap(notify);
@@ -344,18 +354,7 @@ describe('EmailMcpStack', () => {
     expect(notify.Secrets).toBeUndefined();
   });
 
-  test('warns that notify is inert when imageUri is omitted and keeps SSM image across deploys', () => {
-    const anns = Annotations.fromStack(stackOf());
-    anns.hasWarning('*', Match.stringLikeRegexp('inert'));
-    anns.hasWarning('*', Match.stringLikeRegexp(NOTIFY_IMAGE_PARAMETER_NAME));
-    anns.hasWarning('*', Match.stringLikeRegexp('CdkProd before Promote before DeployProd'));
-    anns.hasWarning('*', Match.stringLikeRegexp('Prod-account digest'));
-
-    const withImage = Annotations.fromStack(
-      stackOf({ imageUri: '222222222222.dkr.ecr.us-east-1.amazonaws.com/email-mcp@sha256:abc' }),
-    );
-    withImage.hasNoWarning('*', Match.stringLikeRegexp('inert'));
-
+  test('notify placeholder image matches HTTP and is not an SSM parameter lookup', () => {
     const template = synth();
     const parameters = (template.toJSON().Parameters ?? {}) as Record<string, { Type?: string }>;
     for (const [name, param] of Object.entries(parameters)) {
@@ -364,103 +363,12 @@ describe('EmailMcpStack', () => {
       }
       expect(param.Type).not.toMatch(/SSM::Parameter::Value/);
     }
+    expect(JSON.stringify(template.findResources('Custom::AWS'))).not.toMatch(/NotifyImageUri/);
 
-    const init = awsSdkCallByAction(template, 'putParameter');
-    expect(init.create.service).toBe('SSM');
-    expect(init.create.parameters).toEqual(
-      expect.objectContaining({
-        Name: NOTIFY_IMAGE_PARAMETER_NAME,
-        Value: PLACEHOLDER_IMAGE,
-        Type: 'String',
-        Overwrite: false,
-      }),
-    );
-    expect(init.create.ignoreErrorCodesMatching).toBe('ParameterAlreadyExists');
-    expect(init.update.action).toBe('getParameter');
-    expect(init.update.parameters).toEqual({ Name: NOTIFY_IMAGE_PARAMETER_NAME });
-
-    const lookup = awsSdkCallByAction(template, 'getParameter');
-    expect(lookup.create.service).toBe('SSM');
-    expect(lookup.create.parameters).toEqual({ Name: NOTIFY_IMAGE_PARAMETER_NAME });
-    expect(lookup.update.action).toBe('getParameter');
-    expect(lookup.update.parameters).toEqual({ Name: NOTIFY_IMAGE_PARAMETER_NAME });
-
-    const resources = template.toJSON().Resources as Record<string, { Type?: string; DependsOn?: string[]; Properties?: Record<string, unknown> }>;
-    const lookupId = Object.keys(resources).find(
-      (id) => resources[id].Type === 'Custom::AWS' && id.includes('NotifyImageUriLookup'),
-    );
-    const initId = Object.keys(resources).find(
-      (id) => resources[id].Type === 'Custom::AWS' && id.includes('NotifyImageUriInit'),
-    );
-    expect(lookupId).toBeDefined();
-    expect(initId).toBeDefined();
-    expect(JSON.stringify(resources[lookupId as string].DependsOn ?? [])).toContain(initId);
-
-    const notifyTask = Object.values(template.findResources('AWS::ECS::TaskDefinition')).find(
-      (res) => (res.Properties as { Family?: string }).Family === NOTIFY_TASK_FAMILY,
-    ) as { DependsOn?: string[] } | undefined;
-    expect(JSON.stringify(notifyTask?.DependsOn ?? [])).toMatch(/NotifyImageUriLookup/);
+    const notify = containerByName(taskDefByFamily(template, NOTIFY_TASK_FAMILY), NOTIFY_CONTAINER_NAME);
     const volumeInit = containerByName(taskDefByFamily(template, NOTIFY_TASK_FAMILY), 'volume-init');
-    expect(volumeInit.Image).toEqual(containerByName(taskDefByFamily(template, NOTIFY_TASK_FAMILY), NOTIFY_CONTAINER_NAME).Image);
-
-    const policies = JSON.stringify(template.findResources('AWS::IAM::Policy'));
-    expect(policies).toContain('parameter/email-mcp/notify/image-uri');
-    expect(policies).toContain('ssm:PutParameter');
-    expect(policies).toContain('ssm:GetParameter');
-
-    const imageUri = '222222222222.dkr.ecr.us-east-1.amazonaws.com/email-mcp@sha256:abc';
-    const withImageTemplate = synth({ imageUri });
-    const initWithImage = awsSdkCallByAction(withImageTemplate, 'putParameter');
-    expect(initWithImage.create.parameters).toEqual(
-      expect.objectContaining({
-        Name: NOTIFY_IMAGE_PARAMETER_NAME,
-        Value: imageUri,
-        Overwrite: true,
-      }),
-    );
-    expect(initWithImage.update.action).toBe('putParameter');
-    expect(initWithImage.update.parameters).toEqual(
-      expect.objectContaining({
-        Name: NOTIFY_IMAGE_PARAMETER_NAME,
-        Value: imageUri,
-        Type: 'String',
-        Overwrite: true,
-      }),
-    );
-  });
-
-  test('refreshes notify image lookup each synth while placeholder init stays stable', () => {
-    let now = 1_000;
-    const dateNow = jest.spyOn(Date, 'now').mockImplementation(() => ++now);
-    try {
-      const first = synth();
-      const second = synth();
-      const firstLookup = customResourceByName(first, 'NotifyImageUriLookup');
-      const secondLookup = customResourceByName(second, 'NotifyImageUriLookup');
-      const firstInit = customResourceByName(first, 'NotifyImageUriInit');
-      const secondInit = customResourceByName(second, 'NotifyImageUriInit');
-
-      expect(firstLookup.Properties?.Update).not.toBe(secondLookup.Properties?.Update);
-      expect(parseAwsSdkCall(firstLookup.Properties?.Update).outputPaths).toEqual(['Parameter.Value']);
-      expect(parseAwsSdkCall(firstLookup.Properties?.Update).logApiResponseData).toBe(false);
-
-      expect(firstInit.Properties?.Create).toEqual(secondInit.Properties?.Create);
-      expect(firstInit.Properties?.Update).toEqual(secondInit.Properties?.Update);
-      expect(parseAwsSdkCall(firstInit.Properties?.Create)).toMatchObject({
-        action: 'putParameter',
-        parameters: expect.objectContaining({
-          Name: NOTIFY_IMAGE_PARAMETER_NAME,
-          Value: PLACEHOLDER_IMAGE,
-          Overwrite: false,
-        }),
-      });
-      const initUpdate = parseAwsSdkCall(firstInit.Properties?.Update);
-      expect(initUpdate.action).toBe('getParameter');
-      expect(initUpdate.outputPaths).toEqual(['Parameter.Value']);
-      expect(initUpdate.logApiResponseData).toBe(false);
-    } finally {
-      dateNow.mockRestore();
-    }
+    expect(notify.Image).toBe(PLACEHOLDER_IMAGE);
+    expect(volumeInit.Image).toBe(PLACEHOLDER_IMAGE);
   });
 
   test('PR workflow runs Go test and docker build', () => {

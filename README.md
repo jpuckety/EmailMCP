@@ -25,7 +25,7 @@ SSM Google OAuth secrets for this app are `./run.sh push-secrets-dev` /
 |---|---|
 | `emailmcp/` | Go MCP server & embedded static UI |
 | `web/` | Angular frontend for email account management |
-| `cdk/` | Env stack: VPC, ALB, ECS CodeDeploy blue/green, notify Fargate service, DynamoDB, WAF |
+| `cdk/` | Env stack: VPC, ALB, ECS CodeDeploy blue/green for `email-mcp` and `email-mcp-notify`, DynamoDB, WAF |
 | `Dockerfile` | Multi-stage image build (Angular + Go static binary) |
 
 ## Local development
@@ -57,10 +57,12 @@ and Sent-folder copies. See [emailmcp/README.md](emailmcp/README.md) and [CHANGE
 MCPCICD expects:
 
 - Repo-root `Dockerfile`
-- `cdk/lib/email-mcp-stack.ts` with `DeploymentControllerType.CODE_DEPLOY` and
-  `TASK_FAMILY = 'email-mcp'`
-- `cdk/scripts/prepare-taskdef.js`
-- Container `email-mcp` on port `8080` with `GET /health`
+- `cdk/lib/email-mcp-stack.ts` with `DeploymentControllerType.CODE_DEPLOY` for
+  both `TASK_FAMILY = 'email-mcp'` and `NOTIFY_TASK_FAMILY = 'email-mcp-notify'`
+- `cdk/scripts/prepare-taskdef.js` (optional second arg is the task family;
+  `email-mcp-notify` sets `command` to `-transport notify`)
+- Containers `email-mcp` and `email-mcp-notify` on port `8080` with `GET /health`
+- CodeDeploy applications/groups `email-mcp` and `email-mcp-notify`
 - SSM SecureString parameters in each env account (push from this repo before
   the first CdkDev):
   - `/email-mcp/google-client-id`
@@ -68,62 +70,19 @@ MCPCICD expects:
 
 Hostnames (MCPCICD context): `email-dev.mcp.ecg.co` (Dev) and `email.mcp.ecg.co` (Prod).
 
-MCPCICD CodeDeploy still updates **only** the ALB-backed `email-mcp` service.
-`prepare-taskdef.js` is unchanged. The IMAP IDLE watcher is a second ECS
-service (`email-mcp-notify`, family `email-mcp-notify`) with no ALB and no
-CodeDeploy. MCPCICD is not modified for notify rolls.
+MCPCICD `CdkDev`/`CdkProd` omit `imageUri`, so both task families register the
+busybox `/health` placeholder. **Dev** has no Promote stage (`CdkDev` runs
+before Build); **Prod** order is `CdkProd` → `Promote` → `DeployProd`.
+`DeployDev` / `DeployProd` CodeDeploy **both** services: HTTP `email-mcp` and
+IMAP IDLE `email-mcp-notify`. Notify uses a private ALB listener on port 8081
+(not opened to the internet) so ECS CodeDeploy can health-check `/health`
+during blue/green. Redeploy the MCPCICD EmailMCP pipeline after this change so
+those stages include the `email-mcp-notify` CodeDeploy action.
 
-MCPCICD `CdkDev`/`CdkProd` omit `imageUri`. **Dev has no Promote stage**
-(`CdkDev` runs before Build); the **Prod** order is `CdkProd` → `Promote` →
-`DeployProd`: `CdkProd` runs before Promote, and `DeployProd` CodeDeploys only
-`email-mcp`. Those env-stack deploys do **not** put a real watcher binary on
-`email-mcp-notify` by themselves. The notify image is a provisioning-time
-GetAtt of SSM `/email-mcp/notify/image-uri` (created as the busybox `/health`
-placeholder on first deploy and **not** overwritten when `imageUri` is
-omitted). Until that parameter holds a promoted `email-mcp` digest, the
-service is inert: it answers `GET /health` but does not IDLE or POST webhooks.
-
-After **Dev Build** or **Prod Promote** (manual follow-up), write the digest
-from that environment's ECR account. For Prod, do this **after** Promote and
-use the promoted Prod-account digest; the preceding `CdkProd` cannot pick it
-up, and `DeployProd` does not roll the notify service:
-
-1. `aws ssm put-parameter --name /email-mcp/notify/image-uri --type String --overwrite --value <ecr-uri@sha256:digest>`
-2. To run it **immediately**, copy the current `email-mcp-notify` task
-   definition revision and change **only** the `image` of **both** containers
-   (`email-mcp-notify` and `volume-init`). Keep the bootstrap
-   `entryPoint: ["sh","-c"]` and command — it already `exec`s
-   `/app/emailmcp -transport notify` when that binary exists. Then
-   `aws ecs update-service --cluster email-mcp --service email-mcp-notify --task-definition email-mcp-notify:<rev>`.
-   Replacing the command with `-transport notify` while `entryPoint` is still
-   `sh -c` runs `sh -c -transport notify` and the task crash-loops.
-3. Or do a break-glass `EmailMcpStack` redeploy with `-c imageUri=<digest>`.
-   This bakes the digest into the task definition and overwrites SSM. Pass the
-   same context values MCPCICD uses; for example:
-
-   ```bash
-   cd cdk && npx cdk deploy EmailMcpStack \
-     -c hostname=<MCPCICD-hostname> \
-     -c pipelineAccount=<pipeline-account-id> \
-     -c containerEnv='<same JSON passed by MCPCICD>' \
-     -c hostedZoneName=<hosted-zone-name> \
-     -c hostedZoneId=<hosted-zone-id> \
-     -c imageUri=<environment-account-ecr-uri@sha256:digest>
-   ```
-
-   Use the same `hostname`, `pipelineAccount`, `containerEnv`, and
-   `hostedZoneName`/`hostedZoneId` values MCPCICD passes for that environment.
-   Omitting `pipelineAccount` can remove pipeline SSM parameters and role
-   outputs; omitting `containerEnv` can drop environment-specific task settings.
-
-`--force-new-deployment` alone does **not** change a URI already baked into
-the running revision. The next `EmailMcpStack` deploy re-reads SSM and
-updates the notify task definition image if the parameter changed. A **bad
-digest** in SSM can fail the notify circuit breaker and CloudFormation
-**rolls back the whole stack** (including HTTP `email-mcp`); later pipeline
-runs keep failing until SSM is fixed. Do not register a one-off task
-definition without writing SSM: the next env-stack deploy replaces the
-revision with the SSM image.
+`prepare-taskdef.js` describes each family, substitutes `<IMAGE1_NAME>` on the
+app container, strips the placeholder `entryPoint`/`command` for HTTP, and for
+notify sets `command: ["-transport","notify"]` so the image ENTRYPOINT runs the
+watcher. The `volume-init` sidecar is left unchanged.
 
 Leave `EMAILMCP_NOTIFY_OWNER` unset so each task generates a unique lease
 owner. The notify task does not use Google OAuth secrets; it requires
