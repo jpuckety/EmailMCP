@@ -1,12 +1,14 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -406,6 +408,156 @@ func TestSupervisorLogsIdleRefresh(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestSupervisorLogsIneligibleAccountGates(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*types.Account)
+		reason string
+	}{
+		{
+			name:   "missing webhook",
+			mutate: func(a *types.Account) { a.WebhookURL = "" },
+			reason: "missing webhook_url",
+		},
+		{
+			name:   "missing imap password",
+			mutate: func(a *types.Account) { a.IMAPPassword = "" },
+			reason: "missing imap_password",
+		},
+		{
+			name:   "missing owner",
+			mutate: func(a *types.Account) { a.OwnerUserID = "" },
+			reason: "missing owner or account id",
+		},
+		{
+			name:   "missing account id",
+			mutate: func(a *types.Account) { a.ID = "" },
+			reason: "missing owner or account id",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			acc := testAccount("https://hooks.example.com/mail")
+			tt.mutate(acc)
+			accs := &fakeAccounts{}
+			accs.set(acc)
+			sup := NewSupervisor(Config{
+				Logger:              slog.New(slog.NewJSONHandler(&buf, nil)),
+				OwnerID:             "task-skip-gates",
+				Accounts:            accs,
+				Leases:              NewMemoryStore(),
+				SkipWebhookValidate: true,
+			})
+			sup.reconcile(context.Background())
+			got := buf.String()
+			if !strings.Contains(got, `"msg":"skipping account"`) {
+				t.Fatalf("missing skipping account log: %s", got)
+			}
+			if !strings.Contains(got, `"reason":"`+tt.reason+`"`) {
+				t.Fatalf("missing reason %q in log: %s", tt.reason, got)
+			}
+			if strings.Contains(got, `"msg":"notify worker started"`) {
+				t.Fatalf("worker started for ineligible account: %s", got)
+			}
+		})
+	}
+}
+
+func TestSupervisorLogsInvalidWebhookGate(t *testing.T) {
+	var buf bytes.Buffer
+	accs := &fakeAccounts{}
+	accs.set(testAccount("http://hooks.example.com/mail"))
+	sup := NewSupervisor(Config{
+		Logger:   slog.New(slog.NewJSONHandler(&buf, nil)),
+		OwnerID:  "task-invalid-webhook",
+		Accounts: accs,
+		Leases:   NewMemoryStore(),
+	})
+	sup.reconcile(context.Background())
+	got := buf.String()
+	if !strings.Contains(got, `"msg":"skipping account with invalid webhook"`) {
+		t.Fatalf("missing invalid webhook log: %s", got)
+	}
+	if strings.Contains(got, `"msg":"notify worker started"`) {
+		t.Fatalf("worker started for invalid webhook: %s", got)
+	}
+}
+
+func TestSupervisorLogsWatchLeaseAndWorkerGates(t *testing.T) {
+	acc := testAccount("https://hooks.example.com/mail")
+	acc.WatchFolders = []string{"INBOX"}
+	key := FolderKey(acc.OwnerUserID, acc.ID, "INBOX")
+
+	t.Run("watching folders and worker started", func(t *testing.T) {
+		var buf bytes.Buffer
+		accs := &fakeAccounts{}
+		accs.set(acc)
+		idle := make(chan struct{})
+		sup := NewSupervisor(Config{
+			Logger:              slog.New(slog.NewJSONHandler(&buf, nil)),
+			OwnerID:             "task-watch-gates",
+			Accounts:            accs,
+			Leases:              NewMemoryStore(),
+			Dispatcher:          testDispatcher(http.DefaultClient),
+			SkipWebhookValidate: true,
+			HeartbeatInterval:   time.Hour,
+			FindSent:            func(context.Context, *types.Account) (string, error) { return "", nil },
+			Dial: func(context.Context, *types.Account) (Session, error) {
+				return &fakeSession{
+					snap: imappkg.SelectSnapshot{UIDNext: 1, UIDValidity: 1},
+					idle: idle,
+				}, nil
+			},
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		sup.reconcile(ctx)
+		got := buf.String()
+		cancel()
+		sup.stopAll()
+		for _, want := range []string{
+			`"msg":"notify watching folders"`,
+			`"folders":"INBOX"`,
+			`"msg":"notify worker started"`,
+			`"folder":"INBOX"`,
+			`"account_id":"default"`,
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("missing %s in log: %s", want, got)
+			}
+		}
+	})
+
+	t.Run("lease not acquired", func(t *testing.T) {
+		var buf bytes.Buffer
+		accs := &fakeAccounts{}
+		accs.set(acc)
+		leases := NewMemoryStore()
+		ok, err := leases.Acquire(context.Background(), key, "other-owner", time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("pre-acquire lease: ok=%v err=%v", ok, err)
+		}
+		sup := NewSupervisor(Config{
+			Logger:              slog.New(slog.NewJSONHandler(&buf, nil)),
+			OwnerID:             "task-lease-held",
+			Accounts:            accs,
+			Leases:              leases,
+			SkipWebhookValidate: true,
+		})
+		sup.reconcile(context.Background())
+		got := buf.String()
+		if !strings.Contains(got, `"msg":"lease not acquired; folder already watched"`) {
+			t.Fatalf("missing lease log: %s", got)
+		}
+		if !strings.Contains(got, `"folder":"INBOX"`) {
+			t.Fatalf("missing folder in lease log: %s", got)
+		}
+		if strings.Contains(got, `"msg":"notify worker started"`) {
+			t.Fatalf("worker started without lease: %s", got)
+		}
+	})
 }
 
 func TestSupervisorDefaultFoldersIncludeSent(t *testing.T) {

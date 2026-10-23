@@ -194,7 +194,12 @@ func (s *Supervisor) reconcile(ctx context.Context) {
 	desired := make(map[string]*types.Account)
 	foldersByKey := make(map[string]string)
 	for _, acc := range accs {
-		if acc == nil || acc.WebhookURL == "" || acc.IMAPPassword == "" || acc.OwnerUserID == "" || acc.ID == "" {
+		if acc == nil {
+			continue
+		}
+		if reason := ineligibleAccountReason(acc); reason != "" {
+			s.cfg.Logger.InfoContext(ctx, "skipping account",
+				"account_id", acc.ID, "reason", reason)
 			continue
 		}
 		if !s.cfg.SkipWebhookValidate {
@@ -205,6 +210,8 @@ func (s *Supervisor) reconcile(ctx context.Context) {
 			}
 		}
 		folders := s.watchFolders(ctx, acc)
+		s.cfg.Logger.InfoContext(ctx, "notify watching folders",
+			"account_id", acc.ID, "folders", strings.Join(folders, ","))
 		for _, folder := range folders {
 			key := FolderKey(acc.OwnerUserID, acc.ID, folder)
 			desired[key] = acc
@@ -241,15 +248,18 @@ func (s *Supervisor) reconcile(ctx context.Context) {
 		if running {
 			continue
 		}
+		folder := foldersByKey[key]
 		ok, err := s.cfg.Leases.Acquire(ctx, key, s.cfg.OwnerID, s.cfg.LeaseTTL)
 		if err != nil {
-			s.cfg.Logger.WarnContext(ctx, "lease acquire failed", "error", err, "account_id", acc.ID)
+			s.cfg.Logger.WarnContext(ctx, "lease acquire failed",
+				"error", err, "account_id", acc.ID, "folder", folder)
 			continue
 		}
 		if !ok {
+			s.cfg.Logger.InfoContext(ctx, "lease not acquired; folder already watched",
+				"account_id", acc.ID, "folder", folder, "owner", s.cfg.OwnerID)
 			continue
 		}
-		folder := foldersByKey[key]
 		wctx, cancel := context.WithCancel(ctx)
 		w := &folderWorker{
 			key:    key,
@@ -268,6 +278,8 @@ func (s *Supervisor) reconcile(ctx context.Context) {
 		}
 		s.workers[key] = w
 		s.mu.Unlock()
+		s.cfg.Logger.InfoContext(ctx, "notify worker started",
+			"account_id", acc.ID, "folder", folder)
 		go s.runWorker(wctx, w)
 	}
 }
@@ -639,6 +651,22 @@ func DedicatedSentFinder(dial DialFunc) SentFinder {
 			return "", errors.New("imap session cannot resolve sent folder")
 		}
 		return r.FindSentFolder(ctx)
+	}
+}
+
+func ineligibleAccountReason(acc *types.Account) string {
+	if acc == nil {
+		return "nil account"
+	}
+	switch {
+	case acc.WebhookURL == "":
+		return "missing webhook_url"
+	case acc.IMAPPassword == "":
+		return "missing imap_password"
+	case acc.OwnerUserID == "" || acc.ID == "":
+		return "missing owner or account id"
+	default:
+		return ""
 	}
 }
 
