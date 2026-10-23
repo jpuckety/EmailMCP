@@ -35,7 +35,7 @@ var (
 type Session interface {
 	Select(ctx context.Context, folder string) (imappkg.SelectSnapshot, error)
 	SupportsIdle() bool
-	Idle(ctx context.Context, refresh time.Duration) error
+	Idle(ctx context.Context, refresh time.Duration) (refreshed bool, err error)
 	FetchAfter(ctx context.Context, lastUID uint32) ([]types.EmailSummary, error)
 	Close() error
 	ForceClose()
@@ -486,15 +486,26 @@ func (s *Supervisor) watchOnce(ctx context.Context, w *folderWorker, logger *slo
 		return err
 	}
 
+	loggedIdle := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		idleCtx, cancelIdle := context.WithCancel(ctx)
-		idleDone := make(chan error, 1)
+		type idleWait struct {
+			err       error
+			refreshed bool
+		}
+		idleDone := make(chan idleWait, 1)
+		useIdle := sess.SupportsIdle()
+		if useIdle && !loggedIdle {
+			logger.Info("IMAP IDLE monitoring mailbox", "refresh", s.cfg.IdleRefresh)
+			loggedIdle = true
+		}
 		go func() {
-			if sess.SupportsIdle() {
-				idleDone <- sess.Idle(idleCtx, s.cfg.IdleRefresh)
+			if useIdle {
+				refreshed, err := sess.Idle(idleCtx, s.cfg.IdleRefresh)
+				idleDone <- idleWait{err: err, refreshed: refreshed}
 				return
 			}
 			w.loggedNoIdle.Do(func() {
@@ -504,9 +515,9 @@ func (s *Supervisor) watchOnce(ctx context.Context, w *folderWorker, logger *slo
 			defer timer.Stop()
 			select {
 			case <-idleCtx.Done():
-				idleDone <- idleCtx.Err()
+				idleDone <- idleWait{err: idleCtx.Err()}
 			case <-timer.C:
-				idleDone <- nil
+				idleDone <- idleWait{}
 			}
 		}()
 
@@ -519,8 +530,9 @@ func (s *Supervisor) watchOnce(ctx context.Context, w *folderWorker, logger *slo
 			case <-time.After(idleDrainWait):
 			}
 			return ctx.Err()
-		case err := <-idleDone:
+		case result := <-idleDone:
 			cancelIdle()
+			err := result.err
 			if err != nil && !errors.Is(err, context.Canceled) {
 				if errors.Is(err, imappkg.ErrIdleUnsupported) {
 					if err := sleepCtx(ctx, s.cfg.PollInterval); err != nil {
@@ -529,6 +541,9 @@ func (s *Supervisor) watchOnce(ctx context.Context, w *folderWorker, logger *slo
 				} else {
 					return err
 				}
+			}
+			if result.refreshed && err == nil {
+				logger.Info("IMAP IDLE refreshed")
 			}
 			if err := s.deliverNew(ctx, w, sess, snap.UIDValidity, logger, permBackoff); err != nil {
 				return err
@@ -556,6 +571,11 @@ func (s *Supervisor) deliverNew(ctx context.Context, w *folderWorker, sess Sessi
 		if msg.UID <= wm.LastUID {
 			continue
 		}
+		from := ""
+		if len(msg.From) > 0 {
+			from = msg.From[0].Address
+		}
+		logger.Info("new mailbox message", "uid", msg.UID, "subject", msg.Subject, "from", from)
 		ok, err := s.cfg.Leases.Heartbeat(ctx, w.key, s.cfg.OwnerID, s.cfg.LeaseTTL)
 		if err != nil {
 			return err

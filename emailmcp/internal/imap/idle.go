@@ -140,40 +140,41 @@ func (c *IdleConn) SupportsIdle() bool {
 
 // Idle blocks until EXISTS, refresh, or ctx cancellation. The caller must
 // FetchAfter and then Idle again. Refresh should be ~25 minutes.
-func (c *IdleConn) Idle(ctx context.Context, refresh time.Duration) error {
+// The bool is true when the keep-alive timer fired rather than an EXISTS update.
+func (c *IdleConn) Idle(ctx context.Context, refresh time.Duration) (bool, error) {
 	client, err := c.alive()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if !c.SupportsIdle() {
-		return ErrIdleUnsupported
+		return false, ErrIdleUnsupported
 	}
 	if refresh <= 0 {
 		refresh = DefaultIdleRefresh
 	}
 	cmd, err := client.Idle()
 	if err != nil {
-		return err
+		return false, err
 	}
 	timer := time.NewTimer(refresh)
 	defer timer.Stop()
 	select {
 	case <-c.exists:
 		if err := cmd.Close(); err != nil {
-			return err
+			return false, err
 		}
-		return waitIdleDone(cmd)
+		return false, waitIdleDone(cmd)
 	case <-timer.C:
 		if err := cmd.Close(); err != nil {
-			return err
+			return true, err
 		}
-		return waitIdleDone(cmd)
+		return true, waitIdleDone(cmd)
 	case <-ctx.Done():
 		c.ForceClose()
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 }
 

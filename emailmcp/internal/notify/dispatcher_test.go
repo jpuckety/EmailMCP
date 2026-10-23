@@ -1,10 +1,12 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -23,6 +25,39 @@ func testDispatcher(client *http.Client) *Dispatcher {
 		MaxAttempts:        3,
 		Backoff:            time.Millisecond,
 	})
+}
+
+func TestDispatcherLogsDeliveryResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	d := NewDispatcher(DispatcherConfig{
+		Client:             srv.Client(),
+		Logger:             slog.New(slog.NewJSONHandler(&buf, nil)),
+		SkipHostValidation: true,
+		MaxAttempts:        1,
+	})
+	if err := d.Post(context.Background(), srv.URL, "", "default", "INBOX", types.EmailSummary{UID: 42}); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	for _, want := range []string{
+		`"msg":"webhook delivered"`,
+		`"account_id":"default"`,
+		`"folder":"INBOX"`,
+		`"uid":42`,
+		`"status":202`,
+		`"attempt":1`,
+		`"duration_ms":`,
+		`"host":`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %s in log: %s", want, got)
+		}
+	}
 }
 
 func TestDispatcherPostSuccessAndBearer(t *testing.T) {

@@ -134,7 +134,7 @@ func (d *Dispatcher) Post(ctx context.Context, webhookURL, token, accountID, fol
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		last = d.postOnce(ctx, webhookURL, token, accountID, folder, summary.UID, body)
+		last = d.postOnce(ctx, webhookURL, token, accountID, folder, summary.UID, body, attempt)
 		if last == nil {
 			return nil
 		}
@@ -156,7 +156,8 @@ func (d *Dispatcher) Post(ctx context.Context, webhookURL, token, accountID, fol
 	return last
 }
 
-func (d *Dispatcher) postOnce(ctx context.Context, webhookURL, token, accountID, folder string, uid uint32, body []byte) error {
+func (d *Dispatcher) postOnce(ctx context.Context, webhookURL, token, accountID, folder string, uid uint32, body []byte, attempt int) error {
+	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
 	if err != nil {
 		return sanitizeNetError(err)
@@ -173,6 +174,8 @@ func (d *Dispatcher) postOnce(ctx context.Context, webhookURL, token, accountID,
 			"folder", folder,
 			"uid", uid,
 			"host", webhookHost(webhookURL),
+			"attempt", attempt,
+			"duration_ms", time.Since(start).Milliseconds(),
 			"error", sanitizeNetError(err),
 		)
 		return sanitizeNetError(err)
@@ -186,6 +189,9 @@ func (d *Dispatcher) postOnce(ctx context.Context, webhookURL, token, accountID,
 			"folder", folder,
 			"uid", uid,
 			"status", resp.StatusCode,
+			"attempt", attempt,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"host", webhookHost(webhookURL),
 		)
 		return nil
 	}
@@ -194,6 +200,8 @@ func (d *Dispatcher) postOnce(ctx context.Context, webhookURL, token, accountID,
 		"folder", folder,
 		"uid", uid,
 		"status", resp.StatusCode,
+		"attempt", attempt,
+		"duration_ms", time.Since(start).Milliseconds(),
 		"host", webhookHost(webhookURL),
 	)
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {

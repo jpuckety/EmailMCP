@@ -41,13 +41,14 @@ func (f *fakeAccounts) set(accs ...*types.Account) {
 }
 
 type fakeSession struct {
-	mu       sync.Mutex
-	snap     imappkg.SelectSnapshot
-	msgs     []types.EmailSummary
-	idle     chan struct{}
-	idleErr  error
-	selected []string
-	fetches  int
+	mu          sync.Mutex
+	snap        imappkg.SelectSnapshot
+	msgs        []types.EmailSummary
+	idle        chan struct{}
+	idleErr     error
+	refreshIdle bool
+	selected    []string
+	fetches     int
 }
 
 type messageLogHandler struct {
@@ -79,15 +80,16 @@ func (f *fakeSession) Select(_ context.Context, folder string) (imappkg.SelectSn
 
 func (f *fakeSession) SupportsIdle() bool { return true }
 
-func (f *fakeSession) Idle(ctx context.Context, _ time.Duration) error {
+func (f *fakeSession) Idle(ctx context.Context, _ time.Duration) (bool, error) {
 	select {
 	case <-f.idle:
 		f.mu.Lock()
 		err := f.idleErr
+		refresh := f.refreshIdle
 		f.mu.Unlock()
-		return err
+		return refresh, err
 	case <-ctx.Done():
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 }
 
@@ -170,6 +172,21 @@ func signalIdle(t *testing.T, idle chan struct{}) {
 	case idle <- struct{}{}:
 	case <-time.After(time.Second):
 		t.Fatal("idle not running")
+	}
+}
+
+func waitForLog(t *testing.T, logs <-chan string, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case message := <-logs:
+			if message == want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timeout waiting for log %q", want)
+		}
 	}
 }
 
@@ -277,6 +294,116 @@ func TestSupervisorSnapshotThenPostAndStop(t *testing.T) {
 
 	accs.set() // webhook/account gone
 	waitUntil(t, 2*time.Second, func() bool { return sup.WorkerCount() == 0 })
+	cancel()
+	<-done
+}
+
+func TestSupervisorLogsIdleNewMessageAndWebhook(t *testing.T) {
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	logs := make(chan string, 64)
+	logger := slog.New(&messageLogHandler{messages: logs})
+	sess := &fakeSession{
+		snap: imappkg.SelectSnapshot{UIDNext: 50, UIDValidity: 7},
+		idle: make(chan struct{}),
+	}
+	accs := &fakeAccounts{}
+	acc := testAccount(srv.URL)
+	accs.set(acc)
+	leases := NewMemoryStore()
+	key := FolderKey(acc.OwnerUserID, acc.ID, "INBOX")
+
+	sup := NewSupervisor(Config{
+		Logger:   logger,
+		OwnerID:  "task-logs",
+		Accounts: accs,
+		Leases:   leases,
+		Dispatcher: NewDispatcher(DispatcherConfig{
+			Client:             srv.Client(),
+			Logger:             logger,
+			SkipHostValidation: true,
+			MaxAttempts:        1,
+			Backoff:            time.Millisecond,
+		}),
+		SkipWebhookValidate: true,
+		ReconcileInterval:   40 * time.Millisecond,
+		HeartbeatInterval:   time.Hour,
+		LeaseTTL:            time.Minute,
+		FindSent:            func(context.Context, *types.Account) (string, error) { return "", nil },
+		Dial: func(context.Context, *types.Account) (Session, error) {
+			return sess, nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = sup.Run(ctx)
+	}()
+
+	waitForLog(t, logs, "IMAP IDLE monitoring mailbox", 2*time.Second)
+	sess.add(types.EmailSummary{
+		UID:     50,
+		Subject: "hello",
+		From:    []types.Address{{Address: "a@example.com"}},
+	})
+	signalIdle(t, sess.idle)
+	waitForLog(t, logs, "new mailbox message", 2*time.Second)
+	waitForLog(t, logs, "webhook delivered", 2*time.Second)
+	waitUntil(t, 2*time.Second, func() bool {
+		wm, _ := leases.GetWatermark(context.Background(), key)
+		return posts.Load() == 1 && wm.LastUID == 50
+	})
+
+	cancel()
+	<-done
+}
+
+func TestSupervisorLogsIdleRefresh(t *testing.T) {
+	logs := make(chan string, 64)
+	logger := slog.New(&messageLogHandler{messages: logs})
+	sess := &fakeSession{
+		snap:        imappkg.SelectSnapshot{UIDNext: 10, UIDValidity: 1},
+		idle:        make(chan struct{}),
+		refreshIdle: true,
+	}
+	accs := &fakeAccounts{}
+	accs.set(testAccount("https://hooks.example.com/mail"))
+	sup := NewSupervisor(Config{
+		Logger:              logger,
+		OwnerID:             "task-idle-refresh",
+		Accounts:            accs,
+		Leases:              NewMemoryStore(),
+		Dispatcher:          testDispatcher(http.DefaultClient),
+		SkipWebhookValidate: true,
+		ReconcileInterval:   40 * time.Millisecond,
+		HeartbeatInterval:   time.Hour,
+		LeaseTTL:            time.Minute,
+		FindSent:            func(context.Context, *types.Account) (string, error) { return "", nil },
+		Dial: func(context.Context, *types.Account) (Session, error) {
+			return sess, nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = sup.Run(ctx)
+	}()
+
+	waitForLog(t, logs, "IMAP IDLE monitoring mailbox", 2*time.Second)
+	signalIdle(t, sess.idle)
+	waitForLog(t, logs, "IMAP IDLE refreshed", 2*time.Second)
+
 	cancel()
 	<-done
 }
