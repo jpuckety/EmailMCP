@@ -137,6 +137,8 @@ Cloud deploy and teardown are handled by MCPCICD, not this `run.sh`.
 
 | Tool                  | Description                                              |
 |-----------------------|----------------------------------------------------------|
+| `list_resources`      | List skill guides (same catalog as MCP `resources/list`) |
+| `read_resource`       | Read a skill guide by URI (same markdown as `resources/read`) |
 | `add_email_account`   | Create/replace the user's IMAP + SMTP account (set passwords in the portal) |
 | `list_email_accounts` | List the user's account (no secrets)                     |
 | `remove_email_account`| Delete the user's account config                         |
@@ -154,7 +156,7 @@ Account tools require an `account_id` parameter to specify which email account t
 
 ## Agent guides
 
-The server publishes Markdown skills as MCP resources (MIME `text/markdown`, audience `assistant`). Initialize instructions and related tool descriptions point at these URIs; load a guide with `resources/read` only when needed.
+The server publishes Markdown skills as MCP resources (MIME `text/markdown`, audience `assistant`) and as tools that wrap the same catalog. Many MCP clients never call `resources/list` or `resources/read`; use `list_resources` then `read_resource` with a returned URI. Resource-capable clients can still load the same URIs via `resources/read`. Initialize instructions and related tool descriptions tell agents to call `read_resource` with these URIs.
 
 | URI | When to read |
 |-----|----------------|

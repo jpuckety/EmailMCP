@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -100,6 +101,243 @@ func TestSkillResources_ListAndRead(t *testing.T) {
 	}
 }
 
+func TestListResourcesTool_MatchesNativeCatalog(t *testing.T) {
+	cs := newSkillResourceClient(t)
+	ctx := context.Background()
+
+	listedTools, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	found := false
+	for _, tool := range listedTools.Tools {
+		if tool.Name == "list_resources" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("tools/list missing list_resources")
+	}
+
+	listed, err := cs.ListResources(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+
+	got, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "list_resources"})
+	if err != nil {
+		t.Fatalf("list_resources: %v", err)
+	}
+
+	raw, err := json.Marshal(got.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	type listedSkill struct {
+		URI         string `json:"uri"`
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		MIMEType    string `json:"mime_type"`
+	}
+	var out struct {
+		Resources []listedSkill `json:"resources"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if len(out.Resources) != len(wantSkillURIs) {
+		t.Fatalf("list_resources returned %d resources, want %d", len(out.Resources), len(wantSkillURIs))
+	}
+
+	nativeByURI := make(map[string]*mcp.Resource, len(listed.Resources))
+	for _, r := range listed.Resources {
+		nativeByURI[r.URI] = r
+	}
+	toolByURI := make(map[string]listedSkill, len(out.Resources))
+	for _, r := range out.Resources {
+		if _, dup := toolByURI[r.URI]; dup {
+			t.Fatalf("list_resources duplicate URI %q", r.URI)
+		}
+		toolByURI[r.URI] = r
+	}
+
+	for _, uri := range wantSkillURIs {
+		native, ok := nativeByURI[uri]
+		if !ok {
+			t.Fatalf("resources/list missing %s", uri)
+		}
+		tool, ok := toolByURI[uri]
+		if !ok {
+			t.Fatalf("list_resources missing %s", uri)
+		}
+		if tool.Name != native.Name {
+			t.Errorf("%s name: tool %q, resource %q", uri, tool.Name, native.Name)
+		}
+		if tool.Title != native.Title {
+			t.Errorf("%s title: tool %q, resource %q", uri, tool.Title, native.Title)
+		}
+		if tool.Description != native.Description {
+			t.Errorf("%s description: tool %q, resource %q", uri, tool.Description, native.Description)
+		}
+		if tool.MIMEType != native.MIMEType {
+			t.Errorf("%s mime_type: tool %q, resource %q", uri, tool.MIMEType, native.MIMEType)
+		}
+	}
+}
+
+func TestReadResourceTool_MatchesNativeBodies(t *testing.T) {
+	cs := newSkillResourceClient(t)
+	ctx := context.Background()
+
+	listedTools, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var readTool *mcp.Tool
+	for _, tool := range listedTools.Tools {
+		if tool.Name == "read_resource" {
+			readTool = tool
+			break
+		}
+	}
+	if readTool == nil {
+		t.Fatal("tools/list missing read_resource")
+	}
+	schemaRaw, err := json.Marshal(readTool.InputSchema)
+	if err != nil {
+		t.Fatalf("marshal InputSchema: %v", err)
+	}
+	var schema struct {
+		Required   []string       `json:"required"`
+		Properties map[string]any `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaRaw, &schema); err != nil {
+		t.Fatalf("unmarshal InputSchema: %v", err)
+	}
+	if _, ok := schema.Properties["uri"]; !ok {
+		t.Fatalf("read_resource InputSchema missing uri property: %s", schemaRaw)
+	}
+	foundURI := false
+	for _, name := range schema.Required {
+		if name == "uri" {
+			foundURI = true
+			break
+		}
+	}
+	if !foundURI {
+		t.Fatalf("read_resource uri is not required: %s", schemaRaw)
+	}
+
+	wantFlags := map[string][]string{
+		"email://guides/replying":    {"reply_to_uid", "quote_original"},
+		"email://guides/forwarding":  {"forward_uid", "include_original_attachments"},
+		"email://guides/attachments": {"get_attachment"},
+		"email://guides/drafts":      {"create_draft"},
+	}
+
+	for _, uri := range wantSkillURIs {
+		native, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: uri})
+		if err != nil {
+			t.Fatalf("ReadResource %s: %v", uri, err)
+		}
+		if len(native.Contents) != 1 {
+			t.Fatalf("ReadResource %s: got %d contents, want 1", uri, len(native.Contents))
+		}
+
+		got, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "read_resource",
+			Arguments: map[string]any{"uri": uri},
+		})
+		if err != nil {
+			t.Fatalf("read_resource %s: protocol error: %v", uri, err)
+		}
+		if got.IsError {
+			t.Fatalf("read_resource %s: IsError=true, content=%q", uri, toolText(t, got))
+		}
+
+		text := toolText(t, got)
+		if text != native.Contents[0].Text {
+			t.Errorf("read_resource %s text does not match resources/read", uri)
+		}
+		for _, flag := range wantFlags[uri] {
+			if !strings.Contains(text, flag) {
+				t.Errorf("read_resource %s: missing %q", uri, flag)
+			}
+		}
+
+		raw, err := json.Marshal(got.StructuredContent)
+		if err != nil {
+			t.Fatalf("marshal structured content %s: %v", uri, err)
+		}
+		var out struct {
+			URI      string `json:"uri"`
+			MIMEType string `json:"mime_type"`
+			Text     string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal structured content %s: %v", uri, err)
+		}
+		if out.URI != uri {
+			t.Errorf("read_resource %s structured uri = %q", uri, out.URI)
+		}
+		if out.MIMEType != native.Contents[0].MIMEType {
+			t.Errorf("read_resource %s mime_type: tool %q, resource %q", uri, out.MIMEType, native.Contents[0].MIMEType)
+		}
+		if out.Text != native.Contents[0].Text {
+			t.Errorf("read_resource %s structured text does not match resources/read", uri)
+		}
+	}
+}
+
+func TestReadResourceTool_UnknownURI(t *testing.T) {
+	cs := newSkillResourceClient(t)
+	ctx := context.Background()
+
+	requireToolErrorListsSkillURIs := func(t *testing.T, got *mcp.CallToolResult, err error, label string) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: protocol error %v (MCP tool errors should be IsError results)", label, err)
+		}
+		if got == nil {
+			t.Fatalf("%s: nil result", label)
+		}
+		if !got.IsError {
+			t.Fatalf("%s: IsError=false, want true", label)
+		}
+		msg := toolText(t, got)
+		for _, uri := range wantSkillURIs {
+			if !strings.Contains(msg, uri) {
+				t.Errorf("%s: error %q missing valid URI %q", label, msg, uri)
+			}
+		}
+	}
+
+	got, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "read_resource",
+		Arguments: map[string]any{"uri": "email://guides/nope"},
+	})
+	requireToolErrorListsSkillURIs(t, got, err, "unknown URI")
+
+	got, err = cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "read_resource",
+		Arguments: map[string]any{"uri": ""},
+	})
+	requireToolErrorListsSkillURIs(t, got, err, "empty URI")
+
+	got, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "read_resource"})
+	if err != nil {
+		t.Fatalf("missing uri: protocol error %v (want IsError result)", err)
+	}
+	if got == nil || !got.IsError {
+		t.Fatalf("missing uri: IsError=%v, want true", got != nil && got.IsError)
+	}
+	if msg := toolText(t, got); !strings.Contains(msg, "uri") {
+		t.Errorf("missing uri: error %q does not mention required field uri", msg)
+	}
+}
+
 func TestSkillResources_UnknownURI(t *testing.T) {
 	const unknown = "email://guides/nope"
 
@@ -117,6 +355,7 @@ func TestSkillResources_UnknownURI(t *testing.T) {
 func TestSkillInstructionsAndToolPointers(t *testing.T) {
 	instr := skillInstructions()
 	requireContainsAll(t, instr, wantSkillURIs)
+	requireContainsAll(t, instr, []string{"list_resources", "read_resource"})
 
 	cs := newSkillResourceClient(t)
 	init := cs.InitializeResult()
@@ -127,6 +366,7 @@ func TestSkillInstructionsAndToolPointers(t *testing.T) {
 		t.Errorf("initialize instructions = %q, want %q", init.Instructions, instr)
 	}
 	requireContainsAll(t, init.Instructions, wantSkillURIs)
+	requireContainsAll(t, init.Instructions, []string{"list_resources", "read_resource"})
 
 	listed, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -149,6 +389,7 @@ func TestSkillInstructionsAndToolPointers(t *testing.T) {
 			t.Fatalf("tools/list missing %s", name)
 		}
 		requireContainsAll(t, tool.Description, uris)
+		requireContainsAll(t, tool.Description, []string{"read_resource"})
 	}
 
 	for _, name := range []string{"send_email", "create_draft"} {

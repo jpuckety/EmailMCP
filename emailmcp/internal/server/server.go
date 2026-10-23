@@ -361,6 +361,18 @@ func (r *statusRecorder) Flush() {
 }
 
 func (s *Server) registerTools() {
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name: "list_resources",
+		Description: "List available skill guides (same catalog as MCP resources/list). " +
+			"Use read_resource with a returned uri to load a guide.",
+	}, s.listResources)
+
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name: "read_resource",
+		Description: "Read a skill guide by URI (same markdown as MCP resources/read). " +
+			"URIs come from list_resources, e.g. email://guides/replying.",
+	}, s.readResource)
+
 	// Account management (Config API)
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name: "add_email_account",
@@ -399,7 +411,7 @@ func (s *Server) registerTools() {
 		Description: "Read a single email by UID including text/HTML body and attachment metadata " +
 			"(id/part_id, filename, content_type, size, disposition, content_id, inline). " +
 			"Use get_attachment to fetch attachment bytes. " +
-			"See email://guides/attachments for metadata vs get_attachment.",
+			"Call read_resource with uri email://guides/attachments for metadata vs get_attachment.",
 	}, s.readEmail)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -421,7 +433,7 @@ func (s *Server) registerTools() {
 		Name: "get_attachment",
 		Description: "Fetch one attachment from a message by attachment_id/part_id or filename. " +
 			"Returns base64 data when under the inline size cap, otherwise a short-lived presigned URL if S3 is configured. " +
-			"See email://guides/attachments.",
+			"Call read_resource with uri email://guides/attachments.",
 	}, s.getAttachment)
 
 	// SMTP / drafts
@@ -431,7 +443,7 @@ func (s *Server) registerTools() {
 			"Attachments may be inline base64 (data), an HTTPS URL (url, e.g. a presigned S3 link), or a local path (path, disabled unless allowlisted). " +
 			"Use create_draft instead when the user should review or edit before sending — create_draft never sends. " +
 			"reply_to_uid sets threading headers (and quote_original quotes the original); forward_uid can also re-attach the original files server-side (include_original_attachments). " +
-			"Read email://guides/replying before reply, email://guides/forwarding before forward, email://guides/attachments for files/cid, email://guides/drafts to save instead of send.",
+			"Call read_resource with uri email://guides/replying before reply, email://guides/forwarding before forward, email://guides/attachments for files/cid, email://guides/drafts to save instead of send.",
 	}, s.sendEmail)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -440,7 +452,7 @@ func (s *Server) registerTools() {
 			"Use this when the user wants to review or finish the message later. " +
 			"Accepts the same body, recipients, attachments (data/url/path), reply, and forward options as send_email. " +
 			"Optional folder overrides Drafts discovery (SPECIAL-USE \\Drafts, then Drafts / INBOX.Drafts). " +
-			"Read email://guides/drafts; compose options match send_email (email://guides/replying, email://guides/forwarding, email://guides/attachments).",
+			"Call read_resource with uri email://guides/drafts; compose options match send_email (email://guides/replying, email://guides/forwarding, email://guides/attachments).",
 	}, s.createDraft)
 }
 
