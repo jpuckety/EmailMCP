@@ -109,7 +109,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	// User email account configurations are read/written directly against the
 	// EmailMCPUserConfigs DynamoDB table (the Config API Lambda has been
 	// removed). Falls back to an in-memory store when no table is configured.
-	configStore, err := config.NewStore(ctx, cfg.UserConfigTableName, cfg.ApplicationID, logger)
+	configStore, err := config.NewStore(ctx, cfg.UserConfigTableName, cfg.ApplicationID, cfg.KMSKeyID, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user config store: %w", err)
 	}

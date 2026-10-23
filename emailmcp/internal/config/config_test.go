@@ -29,6 +29,17 @@ func TestRemoteParamsNeeded(t *testing.T) {
 	}
 }
 
+func TestLoadKMSKeyID(t *testing.T) {
+	t.Setenv("EMAILMCP_KMS_KEY_ID", "arn:aws:kms:us-east-1:123456789012:key/test")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.KMSKeyID != "arn:aws:kms:us-east-1:123456789012:key/test" {
+		t.Fatalf("KMSKeyID = %q", cfg.KMSKeyID)
+	}
+}
+
 func TestLoadNotifyDefaultsAndClamps(t *testing.T) {
 	t.Setenv("EMAILMCP_NOTIFY_STATE_TABLE", "")
 	t.Setenv("EMAILMCP_NOTIFY_OWNER", "")

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- IMAP/SMTP passwords are encrypted with the customer-managed KMS key before DynamoDB writes; existing plaintext rows remain readable and are encrypted on their next update.
 - MCP skill resources at `email://guides/replying`, `email://guides/forwarding`, `email://guides/attachments`, and `email://guides/drafts`. Initialize instructions and `send_email` / `create_draft` / `read_email` / `get_attachment` descriptions point at those URIs.
 - `list_resources` and `read_resource` MCP tools that return the same catalog and markdown as `resources/list` / `resources/read`, so tool-only clients can load the guides. Initialize instructions and related tool descriptions tell agents to call `read_resource` with the guide URI.
 

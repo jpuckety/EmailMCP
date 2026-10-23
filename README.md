@@ -8,8 +8,10 @@ exposes IMAP and SMTP email capabilities to MCP clients. It is simultaneously:
 - an MCP server exposing email tools.
 
 Storage is **DynamoDB** (durable, default) or **in-memory** (fallback). IMAP/SMTP
-credentials live as attributes on the user-config table, encrypted at rest with a
-customer-managed KMS key.
+credentials live as attributes on the user-config table, encrypted with a
+customer-managed KMS key before they are written; DynamoDB also encrypts the
+table at rest. Existing plaintext credentials remain readable and are encrypted
+on the next account update. ECS configures this with `EMAILMCP_KMS_KEY_ID`.
 
 AWS deploy and image promotion are owned by
 [MCPCICD](https://github.com/jpuckety/MCPCICD). This repo is the application plus

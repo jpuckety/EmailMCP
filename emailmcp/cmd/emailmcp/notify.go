@@ -41,7 +41,7 @@ func runNotify(ctx context.Context, cfg *config.Config, logger *slog.Logger) err
 	}
 
 	owner := resolveNotifyOwner(cfg.NotifyOwnerID)
-	accounts, err := newUserConfigStore(ctx, cfg.UserConfigTableName, cfg.ApplicationID, logger)
+	accounts, err := newUserConfigStore(ctx, cfg.UserConfigTableName, cfg.ApplicationID, cfg.KMSKeyID, logger)
 	if err != nil {
 		return fmt.Errorf("user config store: %w", err)
 	}

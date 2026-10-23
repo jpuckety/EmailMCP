@@ -46,7 +46,7 @@ type Store interface {
 // NewStore returns a DynamoDB-backed config store when tableName is set and AWS
 // configuration can be loaded; otherwise it falls back to an in-memory store
 // (suitable for local/stdio use and tests) with a warning.
-func NewStore(ctx context.Context, tableName, applicationID string, logger *slog.Logger) (Store, error) {
+func NewStore(ctx context.Context, tableName, applicationID, kmsKeyID string, logger *slog.Logger) (Store, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -58,6 +58,9 @@ func NewStore(ctx context.Context, tableName, applicationID string, logger *slog
 			"(email accounts will not survive a restart or span replicas). " +
 			"Set EMAILMCP_USER_CONFIG_TABLE or the SSM parameter /emailmcp/user-config-table/name")
 		return newMemoryStore(), nil
+	}
+	if kmsKeyID == "" {
+		return nil, errors.New("EMAILMCP_KMS_KEY_ID is required when EMAILMCP_USER_CONFIG_TABLE is configured")
 	}
 
 	var opts []func(*awsconfig.LoadOptions) error
@@ -72,11 +75,13 @@ func NewStore(ctx context.Context, tableName, applicationID string, logger *slog
 		"table", tableName,
 		"application_id", applicationID,
 		"region", cfg.Region,
+		"kms_key_id_set", true,
 	)
 	return &dynamoStore{
 		client:        dynamodb.NewFromConfig(cfg),
 		tableName:     tableName,
 		applicationID: applicationID,
+		secrets:       newKMSPasswordCipher(cfg, kmsKeyID, applicationID),
 	}, nil
 }
 
@@ -93,6 +98,7 @@ type dynamoStore struct {
 	client        *dynamodb.Client
 	tableName     string
 	applicationID string
+	secrets       passwordCipher
 }
 
 // accountItem is the DynamoDB representation of an email account. Credentials
@@ -215,7 +221,7 @@ func (d *dynamoStore) GetUserConfig(ctx context.Context, userID, accountID strin
 	if err != nil {
 		return nil, err
 	}
-	return it.toAccount(), nil
+	return d.accountFromItem(ctx, it)
 }
 
 func (d *dynamoStore) ListUserConfigs(ctx context.Context, userID string) ([]*types.Account, error) {
@@ -239,7 +245,11 @@ func (d *dynamoStore) ListUserConfigs(ctx context.Context, userID string) ([]*ty
 			if err := attributevalue.UnmarshalMap(raw, &it); err != nil {
 				return nil, fmt.Errorf("unmarshal user config: %w", err)
 			}
-			accs = append(accs, it.toAccount())
+			acc, err := d.accountFromItem(ctx, &it)
+			if err != nil {
+				return nil, fmt.Errorf("decrypt user config: %w", err)
+			}
+			accs = append(accs, acc)
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			break
@@ -269,7 +279,11 @@ func (d *dynamoStore) ListAllConfigs(ctx context.Context) ([]*types.Account, err
 			if err := attributevalue.UnmarshalMap(raw, &it); err != nil {
 				return nil, fmt.Errorf("unmarshal user config: %w", err)
 			}
-			accs = append(accs, it.toAccount())
+			acc, err := d.accountFromItem(ctx, &it)
+			if err != nil {
+				return nil, fmt.Errorf("decrypt user config: %w", err)
+			}
+			accs = append(accs, acc)
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			break
@@ -294,6 +308,9 @@ func (d *dynamoStore) PutUserConfig(ctx context.Context, userID string, acc *typ
 	it := newAccountItem(d.applicationID, userID, acc)
 	it.CreatedAt = created
 	it.UpdatedAt = now
+	if err := d.sealAccountItem(ctx, &it); err != nil {
+		return fmt.Errorf("encrypt user config passwords: %w", err)
+	}
 
 	av, err := attributevalue.MarshalMap(it)
 	if err != nil {
@@ -306,6 +323,32 @@ func (d *dynamoStore) PutUserConfig(ctx context.Context, userID string, acc *typ
 		return fmt.Errorf("put user config: %w", err)
 	}
 	return nil
+}
+
+func (d *dynamoStore) sealAccountItem(ctx context.Context, it *accountItem) error {
+	var err error
+	it.IMAPPassword, err = d.secrets.Encrypt(ctx, it.IMAPPassword)
+	if err != nil {
+		return fmt.Errorf("encrypt IMAP password: %w", err)
+	}
+	it.SMTPPassword, err = d.secrets.Encrypt(ctx, it.SMTPPassword)
+	if err != nil {
+		return fmt.Errorf("encrypt SMTP password: %w", err)
+	}
+	return nil
+}
+
+func (d *dynamoStore) accountFromItem(ctx context.Context, it *accountItem) (*types.Account, error) {
+	var err error
+	it.IMAPPassword, err = d.secrets.Decrypt(ctx, it.IMAPPassword)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt IMAP password: %w", err)
+	}
+	it.SMTPPassword, err = d.secrets.Decrypt(ctx, it.SMTPPassword)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt SMTP password: %w", err)
+	}
+	return it.toAccount(), nil
 }
 
 func (d *dynamoStore) DeleteUserConfig(ctx context.Context, userID, accountID string) error {

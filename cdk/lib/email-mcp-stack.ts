@@ -135,7 +135,7 @@ export class EmailMcpStack extends cdk.Stack {
     const dataKey = new kms.Key(this, 'DataKey', {
       alias: 'alias/email-mcp',
       enableKeyRotation: true,
-      description: 'email-mcp: encrypts DynamoDB tables at rest',
+      description: 'email-mcp: encrypts DynamoDB tables and email passwords',
     });
 
     const sessionsTable = new dynamodb.Table(this, 'SessionsTable', {
@@ -345,6 +345,7 @@ export class EmailMcpStack extends cdk.Stack {
         EMAILMCP_TRANSPORT: 'http',
         EMAILMCP_SESSION_TABLE: sessionsTable.tableName,
         EMAILMCP_USER_CONFIG_TABLE: userConfigTable.tableName,
+        EMAILMCP_KMS_KEY_ID: dataKey.keyArn,
         APPLICATION_ID: applicationId,
         AWS_REGION: this.region,
         OAUTH_REDIRECT_ALLOWLIST: oauthRedirectAllowlist,
@@ -555,6 +556,7 @@ export class EmailMcpStack extends cdk.Stack {
         EMAILMCP_TRANSPORT: 'notify',
         EMAILMCP_USER_CONFIG_TABLE: userConfigTable.tableName,
         EMAILMCP_NOTIFY_STATE_TABLE: notifyStateTable.tableName,
+        EMAILMCP_KMS_KEY_ID: dataKey.keyArn,
         APPLICATION_ID: applicationId,
         AWS_REGION: this.region,
         ...extraContainerEnv,

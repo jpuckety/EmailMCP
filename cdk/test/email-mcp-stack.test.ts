@@ -233,6 +233,7 @@ describe('EmailMcpStack', () => {
     const env = envMap(container);
     expect(env.OAUTH_REDIRECT_ALLOWLIST).toBe('https://www.cursor.com/agents/mcp/oauth/callback');
     expect(env.OAUTH_ALLOW_KNOWN_CLIENTS).toBe('true');
+    expect(env.EMAILMCP_KMS_KEY_ID).toBeDefined();
   });
 
   test('pipeline roles are imported by name without creating them', () => {
@@ -327,6 +328,7 @@ describe('EmailMcpStack', () => {
     expect(env.EMAILMCP_TRANSPORT).toBe('notify');
     expect(env.EMAILMCP_USER_CONFIG_TABLE).toBeDefined();
     expect(env.EMAILMCP_NOTIFY_STATE_TABLE).toBeDefined();
+    expect(env.EMAILMCP_KMS_KEY_ID).toBeDefined();
     expect(env.EMAILMCP_NOTIFY_OWNER).toBeUndefined();
     expect(env.GOOGLE_CLIENT_ID).toBeUndefined();
     expect(env.GOOGLE_CLIENT_SECRET).toBeUndefined();

@@ -51,7 +51,7 @@ All tools are registered in `server.go:registerTools()` using `mcp.AddTool`. Han
 
 ### Account storage
 
-There is **no local SQLite or other local account store**. Each authenticated Google user has one account configuration stored in DynamoDB (metadata + encrypted password). Tools:
+There is **no local SQLite or other local account store**. Each authenticated Google user has account configurations stored in DynamoDB. IMAP/SMTP passwords are application-encrypted with KMS before storage; table-level encryption is also enabled. Tools:
 
 - `add_email_account` → PUT DynamoDB
 - `list_email_accounts` → GET DynamoDB (0 or 1 account)
@@ -74,7 +74,7 @@ Pools are keyed by `(OwnerUserID, accountID)` so two users with the same account
 
 ### Credential Handling
 
-Passwords are returned from DynamoDB as plaintext fields on `types.Account` (`IMAPPassword` / `SMTPPassword`) for the lifetime of the operation. Never log them. When `SMTPPassword` is empty, SMTP falls back to `IMAPPassword`.
+Passwords are decrypted from DynamoDB into `types.Account` (`IMAPPassword` / `SMTPPassword`) for the lifetime of the operation. Legacy unprefixed values remain readable and are encrypted the next time the account is written. Never log passwords. When `SMTPPassword` is empty, SMTP falls back to `IMAPPassword`.
 
 ### Transports
 

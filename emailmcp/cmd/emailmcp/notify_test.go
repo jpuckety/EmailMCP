@@ -96,8 +96,8 @@ func TestRunNotifyFailsWithoutUserConfigTable(t *testing.T) {
 
 func TestRunNotifyHealthWithoutGoogleOAuth(t *testing.T) {
 	orig := newUserConfigStore
-	newUserConfigStore = func(ctx context.Context, _, appID string, l *slog.Logger) (config.Store, error) {
-		return orig(ctx, "", appID, l)
+	newUserConfigStore = func(ctx context.Context, _, appID, _ string, l *slog.Logger) (config.Store, error) {
+		return orig(ctx, "", appID, "", l)
 	}
 	t.Cleanup(func() { newUserConfigStore = orig })
 	t.Setenv("GOOGLE_CLIENT_ID", "")

@@ -4,16 +4,18 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
 func newTestStore(t *testing.T) Store {
 	t.Helper()
 	// Empty table name selects the in-memory implementation.
-	s, err := NewStore(context.Background(), "", "emailmcp", nil)
+	s, err := NewStore(context.Background(), "", "emailmcp", "", nil)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -68,6 +70,13 @@ func TestStore_PutGetDelete(t *testing.T) {
 	}
 	if err := s.DeleteUserConfig(ctx, "user1", "acc1"); !errors.Is(err, ErrConfigNotFound) {
 		t.Fatalf("expected ErrConfigNotFound on second delete, got %v", err)
+	}
+}
+
+func TestNewStore_RequiresKMSKeyForDynamoDB(t *testing.T) {
+	_, err := NewStore(context.Background(), "UserConfigs", "emailmcp", "", nil)
+	if err == nil || !strings.Contains(err.Error(), "EMAILMCP_KMS_KEY_ID") {
+		t.Fatalf("NewStore error = %v, want missing KMS key error", err)
 	}
 }
 
@@ -237,6 +246,36 @@ func TestAccountItem_WebhookAttributeRoundTrip(t *testing.T) {
 				t.Fatalf("sort key = %q", decoded.UserID)
 			}
 		})
+	}
+}
+
+func TestAccountItemDoesNotStorePasswordsInPlaintext(t *testing.T) {
+	account := &types.Account{
+		ID:           "account",
+		IMAPPassword: "imap-secret",
+		SMTPPassword: "smtp-secret",
+	}
+	item := newAccountItem("application", "user", account)
+	store := &dynamoStore{secrets: newTestPasswordCipher()}
+	if err := store.sealAccountItem(context.Background(), &item); err != nil {
+		t.Fatalf("sealAccountItem: %v", err)
+	}
+	attributes, err := attributevalue.MarshalMap(item)
+	if err != nil {
+		t.Fatalf("MarshalMap: %v", err)
+	}
+	if got := attributes["imap_password"].(*ddbtypes.AttributeValueMemberS).Value; got == account.IMAPPassword {
+		t.Fatalf("imap_password is stored in plaintext: %q", got)
+	}
+	if got := attributes["smtp_password"].(*ddbtypes.AttributeValueMemberS).Value; got == account.SMTPPassword {
+		t.Fatalf("smtp_password is stored in plaintext: %q", got)
+	}
+	decoded, err := store.accountFromItem(context.Background(), &item)
+	if err != nil {
+		t.Fatalf("accountFromItem: %v", err)
+	}
+	if decoded.IMAPPassword != account.IMAPPassword || decoded.SMTPPassword != account.SMTPPassword {
+		t.Fatalf("password round trip = (%q, %q), want original values", decoded.IMAPPassword, decoded.SMTPPassword)
 	}
 }
 

@@ -48,7 +48,7 @@ func TestGetAccount_RequiredAccountID(t *testing.T) {
 
 func TestListEmailAccounts_ReturnsMap(t *testing.T) {
 	// In-memory config store (no DynamoDB table configured).
-	store, err := config.NewStore(context.Background(), "", "emailmcp", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, err := config.NewStore(context.Background(), "", "emailmcp", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestListEmailAccounts_EmptyWithoutBaseURL(t *testing.T) {
 
 func newAddAccountTestServer(t *testing.T, publicBaseURL string) (*Server, config.Store) {
 	t.Helper()
-	store, err := config.NewStore(context.Background(), "", "emailmcp", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, err := config.NewStore(context.Background(), "", "emailmcp", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}

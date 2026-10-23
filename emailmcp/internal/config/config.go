@@ -52,6 +52,9 @@ type Config struct {
 	// span replicas). Resolved from EMAILMCP_USER_CONFIG_TABLE or the SSM
 	// parameter /emailmcp/user-config-table/name.
 	UserConfigTableName string
+	// KMSKeyID is the customer-managed KMS key used to encrypt email passwords
+	// before they are written to the user config table.
+	KMSKeyID string
 	// NotifyStateTableName is the DynamoDB table used by the notify watcher for
 	// folder leases and UID watermarks. Resolved from EMAILMCP_NOTIFY_STATE_TABLE
 	// or the SSM parameter /emailmcp/notify-state-table/name. Empty is allowed
@@ -101,6 +104,7 @@ func Load() (*Config, error) {
 		PublicBaseURL:            strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/"),
 		SessionTableName:         getEnv("EMAILMCP_SESSION_TABLE", ""),
 		UserConfigTableName:      getEnv("EMAILMCP_USER_CONFIG_TABLE", ""),
+		KMSKeyID:                 getEnv("EMAILMCP_KMS_KEY_ID", ""),
 		NotifyStateTableName:     getEnv("EMAILMCP_NOTIFY_STATE_TABLE", ""),
 		NotifyOwnerID:            strings.TrimSpace(getEnv("EMAILMCP_NOTIFY_OWNER", "")),
 		NotifyReconcileInterval:  getEnvDuration("EMAILMCP_NOTIFY_RECONCILE", 30*time.Second),
@@ -164,6 +168,7 @@ func Load() (*Config, error) {
 		"session_table", cfg.SessionTableName,
 		"user_config_table_set", cfg.UserConfigTableName != "",
 		"user_config_table", cfg.UserConfigTableName,
+		"kms_key_id_set", cfg.KMSKeyID != "",
 		"notify_state_table_set", cfg.NotifyStateTableName != "",
 		"notify_state_table", cfg.NotifyStateTableName,
 		"notify_owner_set", cfg.NotifyOwnerID != "",
