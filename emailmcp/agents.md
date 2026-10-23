@@ -39,6 +39,8 @@ EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) 
 4. Update `agents.md` if the new tool introduces new patterns or constraints.
 5. Add basic validation and error handling.
 
+Long agent procedures live in MCP resources (`email://guides/…`), not in tool descriptions. Keep tool descriptions short and point at the matching guide URI. Guides are embedded Markdown under `internal/server/guides/` and registered in `resources.go`.
+
 ## Working with IMAP
 - Always acquire connections from the pool — never create ad-hoc clients.
 - Be mindful of folder selection state when reusing connections.

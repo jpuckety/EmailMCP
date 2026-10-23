@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- MCP skill resources at `email://guides/replying`, `email://guides/forwarding`, `email://guides/attachments`, and `email://guides/drafts`. Initialize instructions and `send_email` / `create_draft` / `read_email` / `get_attachment` descriptions point at those URIs.
+
 ## 0.3.2 — 2026-10-22
 
 ### Fixed

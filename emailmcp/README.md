@@ -152,6 +152,17 @@ Cloud deploy and teardown are handled by MCPCICD, not this `run.sh`.
 
 Account tools require an `account_id` parameter to specify which email account to use.
 
+## Agent guides
+
+The server publishes Markdown skills as MCP resources (MIME `text/markdown`, audience `assistant`). Initialize instructions and related tool descriptions point at these URIs; load a guide with `resources/read` only when needed.
+
+| URI | When to read |
+|-----|----------------|
+| `email://guides/replying` | Before `send_email` / `create_draft` with `reply_to_uid` |
+| `email://guides/forwarding` | Before forwarding with `forward_uid` |
+| `email://guides/attachments` | Before `get_attachment` or attaching files / `cid:` images |
+| `email://guides/drafts` | When the user should review before send (`create_draft`) |
+
 ## Configuration
 
 EmailMCP uses **remote account storage only** (DynamoDB).

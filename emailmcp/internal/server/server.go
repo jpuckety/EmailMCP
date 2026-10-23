@@ -67,7 +67,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "emailmcp",
 		Version: "0.2.0",
-	}, nil)
+	}, &mcp.ServerOptions{Instructions: skillInstructions()})
 
 	logger := slog.Default()
 
@@ -144,6 +144,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		)
 	}
 	es.registerTools()
+	es.registerResources()
 	es.logger.Info("mcp server initialized")
 
 	return es, nil
@@ -397,7 +398,8 @@ func (s *Server) registerTools() {
 		Name: "read_email",
 		Description: "Read a single email by UID including text/HTML body and attachment metadata " +
 			"(id/part_id, filename, content_type, size, disposition, content_id, inline). " +
-			"Use get_attachment to fetch attachment bytes.",
+			"Use get_attachment to fetch attachment bytes. " +
+			"See email://guides/attachments for metadata vs get_attachment.",
 	}, s.readEmail)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -418,7 +420,8 @@ func (s *Server) registerTools() {
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name: "get_attachment",
 		Description: "Fetch one attachment from a message by attachment_id/part_id or filename. " +
-			"Returns base64 data when under the inline size cap, otherwise a short-lived presigned URL if S3 is configured.",
+			"Returns base64 data when under the inline size cap, otherwise a short-lived presigned URL if S3 is configured. " +
+			"See email://guides/attachments.",
 	}, s.getAttachment)
 
 	// SMTP / drafts
@@ -427,7 +430,8 @@ func (s *Server) registerTools() {
 		Description: "Send an email now (plain text, HTML, attachments). " +
 			"Attachments may be inline base64 (data), an HTTPS URL (url, e.g. a presigned S3 link), or a local path (path, disabled unless allowlisted). " +
 			"Use create_draft instead when the user should review or edit before sending — create_draft never sends. " +
-			"Optional reply_to_uid/forward_uid set threading headers and can re-attach the original files server-side.",
+			"reply_to_uid sets threading headers (and quote_original quotes the original); forward_uid can also re-attach the original files server-side (include_original_attachments). " +
+			"Read email://guides/replying before reply, email://guides/forwarding before forward, email://guides/attachments for files/cid, email://guides/drafts to save instead of send.",
 	}, s.sendEmail)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -435,7 +439,8 @@ func (s *Server) registerTools() {
 		Description: "Save a complete email to the account Drafts folder with the \\Draft flag. Never sends. " +
 			"Use this when the user wants to review or finish the message later. " +
 			"Accepts the same body, recipients, attachments (data/url/path), reply, and forward options as send_email. " +
-			"Optional folder overrides Drafts discovery (SPECIAL-USE \\Drafts, then Drafts / INBOX.Drafts).",
+			"Optional folder overrides Drafts discovery (SPECIAL-USE \\Drafts, then Drafts / INBOX.Drafts). " +
+			"Read email://guides/drafts; compose options match send_email (email://guides/replying, email://guides/forwarding, email://guides/attachments).",
 	}, s.createDraft)
 }
 
