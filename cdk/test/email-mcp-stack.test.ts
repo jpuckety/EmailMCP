@@ -314,6 +314,17 @@ describe('EmailMcpStack', () => {
       Port: NOTIFY_LISTENER_PORT,
       Protocol: 'HTTP',
     });
+    template.resourceCountIs('Custom::NotifyServiceCleanup', 1);
+    template.hasResourceProperties('Custom::NotifyServiceCleanup', {
+      ServiceName: NOTIFY_SERVICE_NAME,
+      Cluster: Match.objectLike({ Ref: Match.stringLikeRegexp('Cluster') }),
+    });
+    const notifySvc = Object.values(template.findResources('AWS::ECS::Service')).find(
+      (svc: { Properties?: { ServiceName?: string } }) => svc.Properties?.ServiceName === NOTIFY_SERVICE_NAME,
+    ) as { DependsOn?: string[] } | undefined;
+    expect(notifySvc).toBeDefined();
+    expect(JSON.stringify(notifySvc?.DependsOn ?? [])).toMatch(/NotifyServiceCleanup/);
+
     template.hasResourceProperties('AWS::CodeDeploy::DeploymentGroup', {
       DeploymentGroupName: NOTIFY_CODEDEPLOY_DEPLOYMENT_GROUP_NAME,
     });

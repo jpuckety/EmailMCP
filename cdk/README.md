@@ -9,7 +9,10 @@ for break-glass.
 `/health` placeholder. Dev has no Promote stage (`CdkDev` runs before Build);
 the Prod order is `CdkProd` → `Promote` → `DeployProd`. `DeployDev`/`DeployProd`
 CodeDeploy **both** services. `prepare-taskdef.js` accepts an optional family
-argument; `email-mcp-notify` sets `command` to `-transport notify`.
+argument; `email-mcp-notify` sets `command` to `-transport notify`. The first
+env-stack deploy after switching notify to CodeDeploy deletes the existing
+rolling `email-mcp-notify` service before creating the blue/green replacement
+(ECS service names cannot be reused while the old service is still draining).
 
 ```bash
 ./run.sh synth

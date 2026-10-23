@@ -14,6 +14,8 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import * as codedeploy from 'aws-cdk-lib/aws-codedeploy';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as cr from 'aws-cdk-lib/custom-resources';
 
 /** Application container name; must match Dockerfile, appspec.yaml, and CodeDeploy. */
 export const APP_CONTAINER_NAME = 'email-mcp';
@@ -44,6 +46,63 @@ export const PLACEHOLDER_IMAGE = 'public.ecr.aws/docker/library/busybox:1.36';
 /** Foreground httpd on the writable `/tmp` volume. Stripped by prepare-taskdef before CodeDeploy. */
 export const PLACEHOLDER_APP_COMMAND =
   'mkdir -p /tmp/www && printf \'ok\\n\' > /tmp/www/health && exec httpd -f -p 8080 -h /tmp/www';
+
+/**
+ * Deletes a rolling (ECS-controller) email-mcp-notify service and waits until the
+ * name is free. CODE_DEPLOY services are left alone so later stack updates are no-ops.
+ */
+const NOTIFY_SERVICE_CLEANUP_PY = `
+import time
+import boto3
+from botocore.exceptions import ClientError
+
+ecs = boto3.client("ecs")
+POLL_SECONDS = 5
+TIMEOUT_SECONDS = 540
+
+def find_service(cluster, name):
+    resp = ecs.describe_services(cluster=cluster, services=[name])
+    for svc in resp.get("services") or []:
+        if svc.get("serviceName") == name and svc.get("status") != "INACTIVE":
+            return svc
+    return None
+
+def handler(event, context):
+    props = event["ResourceProperties"]
+    cluster = props["Cluster"]
+    name = props["ServiceName"]
+    physical_id = cluster + ":" + name
+    if event["RequestType"] == "Delete":
+        return {"PhysicalResourceId": event.get("PhysicalResourceId") or physical_id}
+
+    svc = find_service(cluster, name)
+    if svc is None:
+        return {"PhysicalResourceId": physical_id}
+
+    controller = (svc.get("deploymentController") or {}).get("type", "ECS")
+    if controller == "CODE_DEPLOY":
+        return {"PhysicalResourceId": physical_id}
+
+    try:
+        ecs.delete_service(cluster=cluster, service=name, force=True)
+    except ClientError as err:
+        code = err.response.get("Error", {}).get("Code", "")
+        message = (err.response.get("Error", {}).get("Message") or "").lower()
+        ignorable = (
+            "ServiceNotFoundException",
+            "ClusterNotFoundException",
+            "ServiceNotActiveException",
+        )
+        if code not in ignorable and "not active" not in message and "draining" not in message:
+            raise
+
+    deadline = time.time() + TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if find_service(cluster, name) is None:
+            return {"PhysicalResourceId": physical_id}
+        time.sleep(POLL_SECONDS)
+    raise RuntimeError("timed out waiting for ECS service %s to become inactive" % name)
+`.trim();
 
 export interface EmailMcpStackProps extends cdk.StackProps {
   readonly hostname?: string;
@@ -519,6 +578,11 @@ export class EmailMcpStack extends cdk.Stack {
       cfnNotifyTaskDefinition.addPropertyOverride(`ContainerDefinitions.${index}.ReadonlyRootFilesystem`, true);
     }
 
+    // The previous rolling NotifyService keeps the physical name email-mcp-notify.
+    // Creating NotifyBlueGreenService with the same name fails with AlreadyExists
+    // unless that service is deleted and INACTIVE first (ECS holds the name while draining).
+    const notifyServiceCleanup = replaceRollingNotifyService(this, this.cluster, NOTIFY_SERVICE_NAME);
+
     this.notifyService = new ecs.FargateService(this, 'NotifyBlueGreenService', {
       cluster: this.cluster,
       serviceName: NOTIFY_SERVICE_NAME,
@@ -532,6 +596,7 @@ export class EmailMcpStack extends cdk.Stack {
       healthCheckGracePeriod: cdk.Duration.seconds(120),
       deploymentController: { type: ecs.DeploymentControllerType.CODE_DEPLOY },
     });
+    this.notifyService.node.addDependency(notifyServiceCleanup);
     this.notifyService.attachToApplicationTargetGroup(notifyBlueTargetGroup);
     this.notifyService.connections.allowFrom(this.loadBalancer, ec2.Port.tcp(APP_CONTAINER_PORT));
 
@@ -862,4 +927,46 @@ function parseContainerEnvContext(scope: Construct): Record<string, string> {
     out[name] = entry;
   }
   return out;
+}
+
+/** One-shot replacement helper: free the rolling notify service name for CODE_DEPLOY. */
+function replaceRollingNotifyService(
+  scope: Construct,
+  cluster: ecs.ICluster,
+  serviceName: string,
+): cdk.CustomResource {
+  const fn = new lambda.Function(scope, 'NotifyServiceCleanupFn', {
+    runtime: lambda.Runtime.PYTHON_3_12,
+    handler: 'index.handler',
+    timeout: cdk.Duration.minutes(10),
+    memorySize: 128,
+    description: 'Deletes a rolling email-mcp-notify ECS service so CODE_DEPLOY can reuse the name',
+    code: lambda.Code.fromInline(NOTIFY_SERVICE_CLEANUP_PY),
+  });
+  fn.addToRolePolicy(
+    new iam.PolicyStatement({
+      actions: ['ecs:DescribeServices', 'ecs:DeleteService'],
+      resources: [
+        cluster.clusterArn,
+        cdk.Stack.of(scope).formatArn({
+          service: 'ecs',
+          resource: 'service',
+          resourceName: `${cluster.clusterName}/${serviceName}`,
+        }),
+      ],
+    }),
+  );
+
+  const provider = new cr.Provider(scope, 'NotifyServiceCleanupProvider', {
+    onEventHandler: fn,
+  });
+
+  return new cdk.CustomResource(scope, 'NotifyServiceCleanup', {
+    resourceType: 'Custom::NotifyServiceCleanup',
+    serviceToken: provider.serviceToken,
+    properties: {
+      Cluster: cluster.clusterName,
+      ServiceName: serviceName,
+    },
+  });
 }
