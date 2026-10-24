@@ -4,6 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { finalize } from 'rxjs';
 import { AccountService } from '../../services/account.service';
+import { AuthService } from '../../services/auth.service';
 import { Account, ProviderPreset, VerificationResult } from '../../models/account.model';
 
 @Component({
@@ -753,6 +754,7 @@ export class AccountFormComponent implements OnInit {
   private route = inject(ActivatedRoute);
   private router = inject(Router);
   private accountService = inject(AccountService);
+  private authService = inject(AuthService);
 
   isEditMode = false;
   accountIdParam = '';
@@ -819,6 +821,7 @@ export class AccountFormComponent implements OnInit {
         this.watchFoldersText = foldersToText(acc.watch_folders);
       },
       error: (err) => {
+        if (this.authService.isSessionExpiredError(err)) return;
         this.errorMessage.set(err?.error?.error || `Failed to load account ${id}.`);
       }
     });
@@ -887,6 +890,7 @@ export class AccountFormComponent implements OnInit {
         this.verificationResult.set(res);
       },
       error: (err) => {
+        if (this.authService.isSessionExpiredError(err)) return;
         const message = httpErrorMessage(err, 'Verification request failed');
         this.verificationResult.set({
           success: false,
@@ -955,6 +959,7 @@ export class AccountFormComponent implements OnInit {
         this.router.navigate(['/']);
       },
       error: (err) => {
+        if (this.authService.isSessionExpiredError(err)) return;
         this.errorMessage.set(httpErrorMessage(err, 'Failed to save email account.'));
       }
     });

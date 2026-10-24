@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- Portal redirects to the login screen when an API request reports an expired session instead of showing an error banner.
 - CdkDev can replace the rolling `email-mcp-notify` service with CodeDeploy blue/green: a cleanup custom resource deletes the old ECS service and waits until the name is free before creating the new one.
 - Forwards and quoted replies with a text-only note now include that note in the HTML part, and quoted original HTML is the inner body (not a nested full document).
 

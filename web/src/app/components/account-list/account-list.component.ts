@@ -4,6 +4,7 @@ import { Router, RouterLink } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { finalize } from 'rxjs';
 import { AccountService } from '../../services/account.service';
+import { AuthService } from '../../services/auth.service';
 import { AccountSummary } from '../../models/account.model';
 import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.component';
 
@@ -364,6 +365,7 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
 })
 export class AccountListComponent implements OnInit {
   private accountService = inject(AccountService);
+  private authService = inject(AuthService);
   private router = inject(Router);
 
   accounts = signal<AccountSummary[]>([]);
@@ -391,6 +393,7 @@ export class AccountListComponent implements OnInit {
       },
       error: (err) => {
         this.accounts.set([]);
+        if (this.authService.isSessionExpiredError(err)) return;
         this.errorMessage.set(err?.error?.error || 'Failed to load email accounts.');
       }
     });
@@ -436,6 +439,7 @@ export class AccountListComponent implements OnInit {
       error: (err) => {
         this.isDeleteDialogOpen.set(false);
         this.selectedAccount = null;
+        if (this.authService.isSessionExpiredError(err)) return;
         this.errorMessage.set(err?.error?.error || `Failed to delete account "${name}".`);
       }
     });

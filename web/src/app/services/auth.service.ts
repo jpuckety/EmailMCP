@@ -40,6 +40,19 @@ export class AuthService {
     return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY);
   }
 
+  isSessionExpiredError(error: unknown): boolean {
+    const body = error && typeof error === 'object' && 'error' in error
+      ? (error as { error?: unknown }).error
+      : error;
+
+    if (typeof body === 'string') {
+      return body.trim() === 'Session expired';
+    }
+
+    return !!body && typeof body === 'object' && 'error' in body
+      && (body as { error?: unknown }).error === 'Session expired';
+  }
+
   setToken(token: string, remember: boolean = true): void {
     if (remember) {
       localStorage.setItem(TOKEN_KEY, token);
